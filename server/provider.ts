@@ -166,7 +166,11 @@ export function createChatGptCodexifyProvider() {
                   timestamp: new Date().toISOString(),
                 });
                 emit({ type: "session.turn", sessionId: providerSessionId, turnId, state: "completed" });
-              } else if (run.state === "cancelled" || (run.state === "stale" && interruptedRunIds.has(runId))) {
+              } else if (
+                run.state === "cancelled" ||
+                (run.state === "stale" &&
+                  (interruptedRunIds.has(runId) || /interrupt|cancel/i.test(String(run.error ?? ""))))
+              ) {
                 emit({
                   type: "session.turn",
                   sessionId: providerSessionId,
