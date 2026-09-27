@@ -243,8 +243,8 @@ export function createChatGptCodexifyProvider() {
           }
 
           case "session.open": {
+            const restoredSessionId = restoredBackendSessionId(input.persistence);
             try {
-              const restoredSessionId = restoredBackendSessionId(input.persistence);
               const acquired = restoredSessionId
                 ? await controller<any>({ op: "status", session_id: restoredSessionId })
                 : await controller<any>({ op: "acquire", workspace: input.config.cwd });
@@ -399,22 +399,30 @@ export function createChatGptCodexifyProvider() {
                   if ((error as ControllerError)?.code !== "conflict") throw error;
                 }
 
-                const deadline = Date.now() + INTERRUPT_GRACE_MS;
-                while (session.activeRunId === runId && Date.now() < deadline) {
-                  await new Promise((resolve) => setTimeout(resolve, 100));
-                }
-                if (session.activeRunId === runId) {
-                  await controller({
-                    op: "abandon",
-                    session_id: session.backendSessionId,
-                    reason: "Paseo interrupt acknowledgement timed out",
-                  });
-                  const settleDeadline = Date.now() + 2_000;
-                  while (session.activeRunId === runId && Date.now() < settleDeadline) {
+                // Acknowledge the interrupt as soon as cancellation is accepted.
+                // The ChatGPT turn may need a tool boundary to observe cancel;
+                // waiting for that here makes Paseo treat a valid interrupt as
+                // unacknowledged. Terminalization/recovery happens asynchronously.
+                emit({ type: "request.completed", requestId: input.requestId });
+
+                void (async () => {
+                  const deadline = Date.now() + INTERRUPT_GRACE_MS;
+                  while (session.activeRunId === runId && Date.now() < deadline) {
                     await new Promise((resolve) => setTimeout(resolve, 100));
                   }
-                }
+                  if (session.activeRunId === runId) {
+                    await controller({
+                      op: "abandon",
+                      session_id: session.backendSessionId,
+                      reason: "Paseo interrupt acknowledgement timed out",
+                    });
+                  }
+                })().catch((error) => {
+                  console.warn(`[chatgpt-codexify] interrupt watchdog failed: ${error instanceof Error ? error.message : String(error)}`);
+                });
+                return;
               }
+
               emit({ type: "request.completed", requestId: input.requestId });
             } catch (error) {
               emit({ type: "request.failed", requestId: input.requestId, error: providerError(error) });
