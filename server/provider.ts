@@ -113,6 +113,11 @@ function providerError(error: unknown): { message: string; code?: string } {
   return { message: String(error) };
 }
 
+function isRecoverableBackendError(error: unknown): boolean {
+  const code = (error as ControllerError)?.code;
+  return code === "unavailable" || code === "not_found" || code === "busy";
+}
+
 function promptText(input: any): string {
   if (input?.type !== "message" || !Array.isArray(input.content)) {
     throw new Error("ChatGPT Codexify provider only supports text message prompts");
@@ -207,6 +212,44 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
           }
         }
         return await acquireAvailableBackend(workspace);
+      };
+
+      const rebindAvailableBackend = async (providerSessionId: string, session: SessionState) => {
+        const replacement = await acquireAvailableBackend(session.cwd);
+        if (replacement.workspace?.active_root && replacement.workspace.active_root !== session.cwd) {
+          throw Object.assign(
+            new Error(`ChatGPT backend workspace mismatch: ${replacement.workspace.active_root}`),
+            { code: "conflict" },
+          );
+        }
+        session.backendSessionId = replacement.session_id;
+        session.activeRunId = null;
+        session.activeTurnId = null;
+        if (session.persist) {
+          emit({
+            type: "session.persistence",
+            sessionId: providerSessionId,
+            persistence: persistenceHandle(session),
+          });
+        }
+        return replacement;
+      };
+
+      const ensureAvailableBackend = async (providerSessionId: string, session: SessionState) => {
+        try {
+          const status = await callController<any>({ op: "status", session_id: session.backendSessionId });
+          const current = status?.session;
+          if (current?.workspace?.active_root && current.workspace.active_root !== session.cwd) {
+            throw Object.assign(
+              new Error(`ChatGPT backend workspace mismatch: ${current.workspace.active_root}`),
+              { code: "conflict" },
+            );
+          }
+          if (current?.live && current.accepting_tasks !== false) return current;
+        } catch (error) {
+          if (!isRecoverableBackendError(error)) throw error;
+        }
+        return await rebindAvailableBackend(providerSessionId, session);
       };
 
       const waitForRun = async (providerSessionId: string, session: SessionState, runId: string, turnId: string) => {
@@ -457,11 +500,23 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
 
             try {
               const text = promptText(input.prompt.input);
-              const run = await callController<any>({
-                op: "submit",
-                session_id: session.backendSessionId,
-                prompt: text,
-              });
+              await ensureAvailableBackend(input.sessionId, session);
+              let run;
+              try {
+                run = await callController<any>({
+                  op: "submit",
+                  session_id: session.backendSessionId,
+                  prompt: text,
+                });
+              } catch (error) {
+                if (!isRecoverableBackendError(error)) throw error;
+                await rebindAvailableBackend(input.sessionId, session);
+                run = await callController<any>({
+                  op: "submit",
+                  session_id: session.backendSessionId,
+                  prompt: text,
+                });
+              }
               const turnId = run.run_id as string;
               session.activeRunId = run.run_id;
               session.activeTurnId = turnId;

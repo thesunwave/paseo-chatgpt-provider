@@ -22,6 +22,7 @@ function session(id: string, workspace = "/workspace", extra: Record<string, unk
     session_id: id,
     state: "waiting",
     live: true,
+    accepting_tasks: true,
     workspace: { active_root: workspace, managed_worktree: false },
     pending_commands: 0,
     completed_tasks: 0,
@@ -116,6 +117,190 @@ test("restored active run resumes terminal watcher", async () => {
   await connection.close();
 });
 
+test("idle session rebinds from finished backend before the next prompt", async () => {
+  let workerAFinished = false;
+  const submissions: string[] = [];
+  const { connection, events } = await connectedProvider(async (request) => {
+    if (request.op === "acquire") {
+      return session(workerAFinished ? "worker-b" : "worker-a");
+    }
+    if (request.op === "status") {
+      if (request.session_id === "worker-a") {
+        return {
+          session: workerAFinished
+            ? session("worker-a", "/workspace", { state: "finished", live: false, accepting_tasks: false })
+            : session("worker-a"),
+          tasks: [],
+          timeline: [],
+        };
+      }
+      return { session: session("worker-b"), tasks: [], timeline: [] };
+    }
+    if (request.op === "submit") {
+      submissions.push(request.session_id);
+      return {
+        session_id: request.session_id,
+        run_id: request.session_id === "worker-a" ? "run-a" : "run-b",
+        state: "queued",
+      };
+    }
+    if (request.op === "wait") {
+      return { state: "succeeded", result: request.run_id === "run-a" ? "FIRST" : "SECOND" };
+    }
+    throw new Error(`unexpected op ${request.op}`);
+  });
+
+  await connection.send({
+    type: "session.open",
+    requestId: "open-rebind-finished",
+    sessionId: "provider-session",
+    config: { cwd: "/workspace", persist: true },
+  });
+  await connection.send({
+    type: "session.prompt",
+    sessionId: "provider-session",
+    prompt: {
+      clientMessageId: "message-a",
+      delivery: "auto",
+      input: { type: "message", content: [{ type: "text", text: "first" }] },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  workerAFinished = true;
+  await connection.send({
+    type: "session.prompt",
+    sessionId: "provider-session",
+    prompt: {
+      clientMessageId: "message-b",
+      delivery: "auto",
+      input: { type: "message", content: [{ type: "text", text: "second" }] },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.deepEqual(submissions, ["worker-a", "worker-b"]);
+  const persistenceEvents = events.filter((event) => event.type === "session.persistence");
+  assert.equal(persistenceEvents.at(-1)?.persistence?.data?.backendSessionId, "worker-b");
+  assert.ok(events.some((event) => event.type === "timeline.item" && event.item?.text === "SECOND"));
+  await connection.close();
+});
+
+test("prompt retries once on a backend that dies between status and submit", async () => {
+  let acquireCalls = 0;
+  const submissions: string[] = [];
+  const { connection, events } = await connectedProvider(async (request) => {
+    if (request.op === "acquire") {
+      acquireCalls += 1;
+      return session(acquireCalls === 1 ? "worker-a" : "worker-b");
+    }
+    if (request.op === "status") {
+      return { session: session(request.session_id), tasks: [], timeline: [] };
+    }
+    if (request.op === "submit") {
+      submissions.push(request.session_id);
+      if (request.session_id === "worker-a") throw unavailable("worker-a died");
+      return { session_id: "worker-b", run_id: "run-b", state: "queued" };
+    }
+    if (request.op === "wait") return { state: "succeeded", result: "RECOVERED" };
+    throw new Error(`unexpected op ${request.op}`);
+  });
+
+  await connection.send({
+    type: "session.open",
+    requestId: "open-race",
+    sessionId: "provider-session",
+    config: { cwd: "/workspace", persist: true },
+  });
+  await connection.send({
+    type: "session.prompt",
+    sessionId: "provider-session",
+    prompt: {
+      clientMessageId: "message-race",
+      delivery: "auto",
+      input: { type: "message", content: [{ type: "text", text: "work" }] },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.deepEqual(submissions, ["worker-a", "worker-b"]);
+  assert.ok(events.some((event) => event.type === "timeline.item" && event.item?.text === "RECOVERED"));
+  assert.equal(
+    events.filter((event) => event.type === "session.persistence").at(-1)?.persistence?.data?.backendSessionId,
+    "worker-b",
+  );
+  await connection.close();
+});
+
+test("failed rebind does not poison the Paseo session", async () => {
+  let replacementAvailable = false;
+  let acquireCalls = 0;
+  const { connection, events } = await connectedProvider(async (request) => {
+    if (request.op === "acquire") {
+      acquireCalls += 1;
+      if (acquireCalls === 1) return session("worker-a");
+      if (replacementAvailable) return session("worker-b");
+      throw unavailable("no replacement yet");
+    }
+    if (request.op === "status") {
+      if (request.session_id === "worker-a") {
+        return {
+          session: session("worker-a", "/workspace", { state: "stale", live: false, accepting_tasks: false }),
+          tasks: [],
+          timeline: [],
+        };
+      }
+      return { session: session("worker-b"), tasks: [], timeline: [] };
+    }
+    if (request.op === "submit") {
+      return { session_id: request.session_id, run_id: "run-b", state: "queued" };
+    }
+    if (request.op === "wait") return { state: "succeeded", result: "AFTER_RETRY" };
+    throw new Error(`unexpected op ${request.op}`);
+  }, { acquireRetryMs: 0 });
+
+  await connection.send({
+    type: "session.open",
+    requestId: "open-no-replacement",
+    sessionId: "provider-session",
+    config: { cwd: "/workspace", persist: true },
+  });
+
+  await connection.send({
+    type: "session.prompt",
+    sessionId: "provider-session",
+    prompt: {
+      clientMessageId: "message-no-replacement",
+      delivery: "auto",
+      input: { type: "message", content: [{ type: "text", text: "first try" }] },
+    },
+  });
+  const firstResult = events.find(
+    (event) => event.type === "session.prompt_result" && event.clientMessageId === "message-no-replacement",
+  );
+  assert.equal(firstResult?.result?.type, "failed");
+  assert.equal(firstResult?.result?.error?.code, "unavailable");
+
+  replacementAvailable = true;
+  await connection.send({
+    type: "session.prompt",
+    sessionId: "provider-session",
+    prompt: {
+      clientMessageId: "message-after-replacement",
+      delivery: "auto",
+      input: { type: "message", content: [{ type: "text", text: "second try" }] },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.ok(events.some((event) => event.type === "timeline.item" && event.item?.text === "AFTER_RETRY"));
+  assert.equal(
+    events.filter((event) => event.type === "session.persistence").at(-1)?.persistence?.data?.backendSessionId,
+    "worker-b",
+  );
+  await connection.close();
+});
+
 test("active run publishes backend tool timeline as live Paseo tool progress", async () => {
   let waitCalls = 0;
   const toolStarted = {
@@ -190,6 +375,7 @@ test("interrupt is acknowledged before backend terminalization", async () => {
   });
   const { connection, events } = await connectedProvider(async (request) => {
     if (request.op === "acquire") return session("healthy");
+    if (request.op === "status") return { session: session("healthy"), tasks: [], timeline: [] };
     if (request.op === "submit") return { session_id: "healthy", run_id: "run-2", state: "queued" };
     if (request.op === "wait") return await waitPromise;
     if (request.op === "cancel") return { accepted: true, action: "cancel" };
