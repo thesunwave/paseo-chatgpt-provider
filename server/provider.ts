@@ -4,11 +4,21 @@ import { createConnection } from "node:net";
 const PROVIDER_PROTOCOL_VERSION = 1;
 const DEFAULT_SOCKET_PATH = "/Users/Shared/codexify-chatgpt/backend.sock";
 const INTERRUPT_GRACE_MS = 20_000;
+const ACQUIRE_RETRY_MS = 2_500;
+const ACQUIRE_RETRY_INTERVAL_MS = 100;
 const SUPPORTED_CAPABILITIES = ["prompt.message", "prompt.steer", "session.persistence"] as const;
 
 type JsonRecord = Record<string, unknown>;
 
 type ControllerError = Error & { code?: string };
+
+type ControllerCall = <T = unknown>(request: JsonRecord) => Promise<T>;
+
+export type ChatGptCodexifyProviderOptions = {
+  controller?: ControllerCall;
+  acquireRetryMs?: number;
+  acquireRetryIntervalMs?: number;
+};
 
 type SessionState = {
   backendSessionId: string;
@@ -119,7 +129,11 @@ function isTerminalState(state: string): boolean {
   return ["succeeded", "failed", "cancelled", "stale"].includes(state);
 }
 
-export function createChatGptCodexifyProvider() {
+export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOptions = {}) {
+  const callController = options.controller ?? controller;
+  const acquireRetryMs = options.acquireRetryMs ?? ACQUIRE_RETRY_MS;
+  const acquireRetryIntervalMs = options.acquireRetryIntervalMs ?? ACQUIRE_RETRY_INTERVAL_MS;
+
   return {
     id: "chatgpt-codexify",
     label: "ChatGPT via Codexify",
@@ -142,11 +156,48 @@ export function createChatGptCodexifyProvider() {
         for (const listener of listeners) listener(event);
       };
 
+      const acquireAvailableBackend = async (workspace?: string) => {
+        const deadline = Date.now() + Math.max(0, acquireRetryMs);
+        for (;;) {
+          try {
+            return await callController<any>({
+              op: "acquire",
+              ...(workspace ? { workspace } : {}),
+            });
+          } catch (error) {
+            if ((error as ControllerError)?.code !== "unavailable" || Date.now() >= deadline) {
+              throw error;
+            }
+            await new Promise((resolve) => setTimeout(resolve, Math.max(1, acquireRetryIntervalMs)));
+          }
+        }
+      };
+
+      const resolveBackendSession = async (workspace: string, restoredSessionId: string | null) => {
+        if (restoredSessionId) {
+          try {
+            const status = await callController<any>({ op: "status", session_id: restoredSessionId });
+            const restored = status?.session;
+            if (restored?.workspace?.active_root && restored.workspace.active_root !== workspace) {
+              throw Object.assign(
+                new Error(`ChatGPT backend workspace mismatch: ${restored.workspace.active_root}`),
+                { code: "conflict" },
+              );
+            }
+            if (restored?.live) return restored;
+          } catch (error) {
+            const code = (error as ControllerError)?.code;
+            if (code !== "not_found" && code !== "unavailable") throw error;
+          }
+        }
+        return await acquireAvailableBackend(workspace);
+      };
+
       const waitForRun = async (providerSessionId: string, session: SessionState, runId: string, turnId: string) => {
         try {
           while (!closed && !session.closed) {
             try {
-              const run = await controller<any>({
+              const run = await callController<any>({
                 op: "wait",
                 session_id: session.backendSessionId,
                 run_id: runId,
@@ -222,10 +273,9 @@ export function createChatGptCodexifyProvider() {
         switch (input.type) {
           case "catalog": {
             try {
-              await controller({
-                op: "acquire",
-                ...(typeof input.cwd === "string" && input.cwd ? { workspace: input.cwd } : {}),
-              });
+              await acquireAvailableBackend(
+                typeof input.cwd === "string" && input.cwd ? input.cwd : undefined,
+              );
               emit({
                 type: "catalog",
                 requestId: input.requestId,
@@ -245,13 +295,7 @@ export function createChatGptCodexifyProvider() {
           case "session.open": {
             const restoredSessionId = restoredBackendSessionId(input.persistence);
             try {
-              const acquired = restoredSessionId
-                ? await controller<any>({ op: "status", session_id: restoredSessionId })
-                : await controller<any>({ op: "acquire", workspace: input.config.cwd });
-              const backendSession = restoredSessionId ? acquired.session : acquired;
-              if (!backendSession?.live) {
-                throw Object.assign(new Error(`ChatGPT backend session ${restoredSessionId ?? ""} is unavailable`), { code: "unavailable" });
-              }
+              const backendSession = await resolveBackendSession(input.config.cwd, restoredSessionId);
               if (backendSession.workspace?.active_root && backendSession.workspace.active_root !== input.config.cwd) {
                 throw Object.assign(new Error(`ChatGPT backend workspace mismatch: ${backendSession.workspace.active_root}`), { code: "conflict" });
               }
@@ -286,6 +330,9 @@ export function createChatGptCodexifyProvider() {
                 },
               });
               emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
+              if (state.activeRunId && state.activeTurnId) {
+                void waitForRun(input.sessionId, state, state.activeRunId, state.activeTurnId);
+              }
             } catch (error) {
               emit({ type: "request.failed", requestId: input.requestId, error: providerError(error) });
             }
@@ -298,7 +345,7 @@ export function createChatGptCodexifyProvider() {
             if (session.activeRunId && session.activeTurnId) {
               try {
                 const instruction = promptText(input.prompt.input);
-                await controller({
+                await callController({
                   op: "steer",
                   session_id: session.backendSessionId,
                   run_id: session.activeRunId,
@@ -344,7 +391,7 @@ export function createChatGptCodexifyProvider() {
 
             try {
               const text = promptText(input.prompt.input);
-              const run = await controller<any>({
+              const run = await callController<any>({
                 op: "submit",
                 session_id: session.backendSessionId,
                 prompt: text,
@@ -389,7 +436,7 @@ export function createChatGptCodexifyProvider() {
               if (session && runId) {
                 interruptedRunIds.add(runId);
                 try {
-                  await controller({
+                  await callController({
                     op: "cancel",
                     session_id: session.backendSessionId,
                     run_id: runId,
@@ -411,7 +458,7 @@ export function createChatGptCodexifyProvider() {
                     await new Promise((resolve) => setTimeout(resolve, 100));
                   }
                   if (session.activeRunId === runId) {
-                    await controller({
+                    await callController({
                       op: "abandon",
                       session_id: session.backendSessionId,
                       reason: "Paseo interrupt acknowledgement timed out",

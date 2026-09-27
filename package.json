@@ -13,7 +13,8 @@
     "shared/"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test server/provider.test.ts"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.9.2",
