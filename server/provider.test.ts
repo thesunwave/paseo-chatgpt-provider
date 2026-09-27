@@ -1,11 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { ProviderEventSchema } from "@getpaseo/plugin/server/provider";
+
 import { createChatGptCodexifyProvider } from "./provider.ts";
 
 function unavailable(message = "unavailable") {
   const error = new Error(message) as Error & { code?: string };
   error.code = "unavailable";
+  return error;
+}
+
+function timedOut(message = "timed out") {
+  const error = new Error(message) as Error & { code?: string };
+  error.code = "timed_out";
   return error;
 }
 
@@ -105,6 +113,73 @@ test("restored active run resumes terminal watcher", async () => {
 
   assert.ok(events.some((event) => event.type === "timeline.item" && event.item?.text === "RESTORED_OK"));
   assert.ok(events.some((event) => event.type === "session.turn" && event.turnId === "run-1" && event.state === "completed"));
+  await connection.close();
+});
+
+test("active run publishes backend tool timeline as live Paseo tool progress", async () => {
+  let waitCalls = 0;
+  const toolStarted = {
+    at_ms: 1_000,
+    kind: "tool_started",
+    seq: 7,
+    command_seq: 3,
+    tool: "exec_command",
+    tool_status: "running",
+  };
+  const toolCompleted = {
+    at_ms: 1_250,
+    kind: "tool_completed",
+    seq: 7,
+    command_seq: 3,
+    tool: "exec_command",
+    tool_status: "succeeded",
+    duration_ms: 250,
+  };
+  const { connection, events } = await connectedProvider(async (request) => {
+    if (request.op === "acquire") return session("healthy");
+    if (request.op === "submit") return { session_id: "healthy", run_id: "run-3", state: "queued" };
+    if (request.op === "wait") {
+      waitCalls += 1;
+      if (waitCalls === 1) throw timedOut();
+      return { state: "succeeded", result: "DONE" };
+    }
+    if (request.op === "status") {
+      return {
+        session: session("healthy", "/workspace", { state: "working", active_run_id: "run-3" }),
+        tasks: [{ command_seq: 3 }],
+        timeline: waitCalls === 1 ? [toolStarted] : [toolStarted, toolCompleted],
+      };
+    }
+    throw new Error(`unexpected op ${request.op}`);
+  });
+
+  await connection.send({
+    type: "session.open",
+    requestId: "open-progress",
+    sessionId: "provider-session",
+    config: { cwd: "/workspace", persist: true },
+  });
+  await connection.send({
+    type: "session.prompt",
+    sessionId: "provider-session",
+    prompt: {
+      clientMessageId: "message-progress",
+      delivery: "auto",
+      input: { type: "message", content: [{ type: "text", text: "work" }] },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const toolEvents = events.filter((event) => event.type === "timeline.item" && event.item?.type === "tool_call");
+  for (const event of toolEvents) ProviderEventSchema.parse(event);
+  assert.deepEqual(toolEvents.map((event) => event.item.status), ["running", "completed"]);
+  assert.equal(toolEvents[0]?.item.id, toolEvents[1]?.item.id);
+  assert.equal(toolEvents[0]?.item.callId, toolEvents[1]?.item.callId);
+  assert.equal(toolEvents[0]?.item.name, "exec_command");
+  assert.equal(toolEvents[1]?.item.metadata?.durationMs, 250);
+  assert.equal(toolEvents[1]?.timestamp, new Date(1_250).toISOString());
+  assert.ok(events.some((event) => event.type === "timeline.item" && event.item?.text === "DONE"));
+  assert.ok(events.some((event) => event.type === "session.turn" && event.turnId === "run-3" && event.state === "completed"));
   await connection.close();
 });
 

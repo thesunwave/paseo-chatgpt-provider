@@ -6,6 +6,7 @@ const DEFAULT_SOCKET_PATH = "/Users/Shared/codexify-chatgpt/backend.sock";
 const INTERRUPT_GRACE_MS = 20_000;
 const ACQUIRE_RETRY_MS = 2_500;
 const ACQUIRE_RETRY_INTERVAL_MS = 100;
+const PROGRESS_POLL_MS = 500;
 const SUPPORTED_CAPABILITIES = ["prompt.message", "prompt.steer", "session.persistence"] as const;
 
 type JsonRecord = Record<string, unknown>;
@@ -129,6 +130,21 @@ function isTerminalState(state: string): boolean {
   return ["succeeded", "failed", "cancelled", "stale"].includes(state);
 }
 
+function toolCallStatus(entry: any): "running" | "completed" | "failed" | "canceled" | null {
+  if (entry?.kind === "tool_started") return "running";
+  if (entry?.kind !== "tool_completed") return null;
+  switch (entry.tool_status) {
+    case "succeeded":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "cancelled":
+      return "canceled";
+    default:
+      return null;
+  }
+}
+
 export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOptions = {}) {
   const callController = options.controller ?? controller;
   const acquireRetryMs = options.acquireRetryMs ?? ACQUIRE_RETRY_MS;
@@ -194,6 +210,52 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
       };
 
       const waitForRun = async (providerSessionId: string, session: SessionState, runId: string, turnId: string) => {
+        const toolStates = new Map<number, string>();
+        const emitToolProgress = async () => {
+          try {
+            const status = await callController<any>({ op: "status", session_id: session.backendSessionId });
+            const taskSeq = Array.isArray(status?.tasks) ? status.tasks.at(-1)?.command_seq : null;
+            if (typeof taskSeq !== "number" || !Array.isArray(status?.timeline)) return;
+
+            const latestBySeq = new Map<number, any>();
+            for (const entry of status.timeline) {
+              if (entry?.command_seq !== taskSeq || typeof entry?.seq !== "number") continue;
+              if (entry.kind !== "tool_started" && entry.kind !== "tool_completed") continue;
+              const previous = latestBySeq.get(entry.seq);
+              if (!previous || entry.kind === "tool_completed") latestBySeq.set(entry.seq, entry);
+            }
+
+            for (const [seq, entry] of [...latestBySeq.entries()].sort(([a], [b]) => a - b)) {
+              const nextState = toolCallStatus(entry);
+              const tool = typeof entry.tool === "string" && entry.tool ? entry.tool : "tool";
+              if (!nextState || toolStates.get(seq) === nextState) continue;
+              toolStates.set(seq, nextState);
+              const itemId = `tool-${turnId}-${seq}`;
+              emit({
+                type: "timeline.item",
+                sessionId: providerSessionId,
+                item: {
+                  id: itemId,
+                  type: "tool_call",
+                  callId: itemId,
+                  name: tool,
+                  detail: { type: "plain_text", label: tool, icon: "wrench" },
+                  status: nextState,
+                  error: nextState === "failed" ? { message: `${tool} failed` } : null,
+                  metadata: {
+                    backendToolSeq: seq,
+                    backendTaskSeq: taskSeq,
+                    ...(typeof entry.duration_ms === "number" ? { durationMs: entry.duration_ms } : {}),
+                  },
+                },
+                ...(typeof entry.at_ms === "number" ? { timestamp: new Date(entry.at_ms).toISOString() } : {}),
+              });
+            }
+          } catch {
+            // Progress is best-effort; terminal run state remains authoritative.
+          }
+        };
+
         try {
           while (!closed && !session.closed) {
             try {
@@ -201,8 +263,9 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
                 op: "wait",
                 session_id: session.backendSessionId,
                 run_id: runId,
-                timeout_ms: 60_000,
+                timeout_ms: PROGRESS_POLL_MS,
               });
+              await emitToolProgress();
               if (!isTerminalState(run.state)) continue;
 
               if (run.state === "succeeded") {
@@ -247,7 +310,10 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
               }
               return;
             } catch (error) {
-              if ((error as ControllerError)?.code === "timed_out") continue;
+              if ((error as ControllerError)?.code === "timed_out") {
+                await emitToolProgress();
+                continue;
+              }
               throw error;
             }
           }
