@@ -291,16 +291,7 @@ export function createChatGptCodexifyProvider() {
           case "session.prompt": {
             const session = sessions.get(input.sessionId);
             if (!session || session.closed) throw new Error(`Unknown provider session ${input.sessionId}`);
-            if (input.prompt.delivery === "steer") {
-              if (!session.activeRunId || !session.activeTurnId) {
-                emit({
-                  type: "session.prompt_result",
-                  sessionId: input.sessionId,
-                  clientMessageId: input.prompt.clientMessageId,
-                  result: { type: "failed", error: { message: "No active ChatGPT backend turn to steer", code: "unavailable" } },
-                });
-                return;
-              }
+            if (session.activeRunId && session.activeTurnId) {
               try {
                 const instruction = promptText(input.prompt.input);
                 await controller({
@@ -337,36 +328,14 @@ export function createChatGptCodexifyProvider() {
               return;
             }
 
-            if (session.activeRunId) {
-              try {
-                const activeRunId = session.activeRunId;
-                try {
-                  await controller({
-                    op: "cancel",
-                    session_id: session.backendSessionId,
-                    run_id: activeRunId,
-                    reason: "Superseded by a new Paseo prompt",
-                  });
-                } catch (error) {
-                  const code = (error as ControllerError)?.code;
-                  if (code !== "conflict") throw error;
-                }
-                const deadline = Date.now() + 30_000;
-                while (session.activeRunId === activeRunId && Date.now() < deadline) {
-                  await new Promise((resolve) => setTimeout(resolve, 100));
-                }
-                if (session.activeRunId === activeRunId) {
-                  throw Object.assign(new Error("Timed out waiting for the active ChatGPT backend turn to stop"), { code: "timed_out" });
-                }
-              } catch (error) {
-                emit({
-                  type: "session.prompt_result",
-                  sessionId: input.sessionId,
-                  clientMessageId: input.prompt.clientMessageId,
-                  result: { type: "failed", error: providerError(error) },
-                });
-                return;
-              }
+            if (input.prompt.delivery === "steer") {
+              emit({
+                type: "session.prompt_result",
+                sessionId: input.sessionId,
+                clientMessageId: input.prompt.clientMessageId,
+                result: { type: "failed", error: { message: "No active ChatGPT backend turn to steer", code: "unavailable" } },
+              });
+              return;
             }
 
             try {
