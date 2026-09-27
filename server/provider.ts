@@ -3,6 +3,7 @@ import { createConnection } from "node:net";
 
 const PROVIDER_PROTOCOL_VERSION = 1;
 const DEFAULT_SOCKET_PATH = "/Users/Shared/codexify-chatgpt/backend.sock";
+const INTERRUPT_GRACE_MS = 20_000;
 const SUPPORTED_CAPABILITIES = ["prompt.message", "prompt.steer", "session.persistence"] as const;
 
 type JsonRecord = Record<string, unknown>;
@@ -133,6 +134,7 @@ export function createChatGptCodexifyProvider() {
       );
       const listeners = new Set<(event: any) => void>();
       const sessions = new Map<string, SessionState>();
+      const interruptedRunIds = new Set<string>();
       let closed = false;
 
       const emit = (event: any) => {
@@ -164,13 +166,17 @@ export function createChatGptCodexifyProvider() {
                   timestamp: new Date().toISOString(),
                 });
                 emit({ type: "session.turn", sessionId: providerSessionId, turnId, state: "completed" });
-              } else if (run.state === "cancelled") {
+              } else if (run.state === "cancelled" || (run.state === "stale" && interruptedRunIds.has(runId))) {
                 emit({
                   type: "session.turn",
                   sessionId: providerSessionId,
                   turnId,
                   state: "canceled",
-                  error: { message: run.error ?? "Cancelled" },
+                  error: {
+                    message: run.error ?? (run.state === "stale"
+                      ? "Interrupted by Paseo; backend session abandoned after cancel timeout"
+                      : "Cancelled"),
+                  },
                 });
               } else {
                 emit({
@@ -199,6 +205,7 @@ export function createChatGptCodexifyProvider() {
             error: providerError(error),
           });
         } finally {
+          interruptedRunIds.delete(runId);
           if (session.activeRunId === runId) {
             session.activeRunId = null;
             session.activeTurnId = null;
@@ -405,13 +412,35 @@ export function createChatGptCodexifyProvider() {
           case "session.interrupt": {
             const session = sessions.get(input.sessionId);
             try {
-              if (session?.activeRunId) {
-                await controller({
-                  op: "cancel",
-                  session_id: session.backendSessionId,
-                  run_id: session.activeRunId,
-                  reason: "Interrupted by Paseo",
-                });
+              const runId = session?.activeRunId ?? null;
+              if (session && runId) {
+                interruptedRunIds.add(runId);
+                try {
+                  await controller({
+                    op: "cancel",
+                    session_id: session.backendSessionId,
+                    run_id: runId,
+                    reason: "Interrupted by Paseo",
+                  });
+                } catch (error) {
+                  if ((error as ControllerError)?.code !== "conflict") throw error;
+                }
+
+                const deadline = Date.now() + INTERRUPT_GRACE_MS;
+                while (session.activeRunId === runId && Date.now() < deadline) {
+                  await new Promise((resolve) => setTimeout(resolve, 100));
+                }
+                if (session.activeRunId === runId) {
+                  await controller({
+                    op: "abandon",
+                    session_id: session.backendSessionId,
+                    reason: "Paseo interrupt acknowledgement timed out",
+                  });
+                  const settleDeadline = Date.now() + 2_000;
+                  while (session.activeRunId === runId && Date.now() < settleDeadline) {
+                    await new Promise((resolve) => setTimeout(resolve, 100));
+                  }
+                }
               }
               emit({ type: "request.completed", requestId: input.requestId });
             } catch (error) {
