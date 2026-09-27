@@ -295,11 +295,23 @@ export function createChatGptCodexifyProvider() {
                 return;
               }
               try {
+                const instruction = promptText(input.prompt.input);
                 await controller({
                   op: "steer",
                   session_id: session.backendSessionId,
                   run_id: session.activeRunId,
-                  instruction: promptText(input.prompt.input),
+                  instruction,
+                });
+                emit({
+                  type: "timeline.item",
+                  sessionId: input.sessionId,
+                  item: {
+                    id: `user-${input.prompt.clientMessageId}`,
+                    type: "user_message",
+                    text: instruction,
+                    clientMessageId: input.prompt.clientMessageId,
+                  },
+                  timestamp: new Date().toISOString(),
                 });
                 emit({
                   type: "session.prompt_result",
@@ -321,18 +333,23 @@ export function createChatGptCodexifyProvider() {
             if (session.activeRunId) {
               try {
                 const activeRunId = session.activeRunId;
-                await controller({
-                  op: "cancel",
-                  session_id: session.backendSessionId,
-                  run_id: activeRunId,
-                  reason: "Superseded by a new Paseo prompt",
-                });
+                try {
+                  await controller({
+                    op: "cancel",
+                    session_id: session.backendSessionId,
+                    run_id: activeRunId,
+                    reason: "Superseded by a new Paseo prompt",
+                  });
+                } catch (error) {
+                  const code = (error as ControllerError)?.code;
+                  if (code !== "conflict") throw error;
+                }
                 const deadline = Date.now() + 30_000;
                 while (session.activeRunId === activeRunId && Date.now() < deadline) {
                   await new Promise((resolve) => setTimeout(resolve, 100));
                 }
                 if (session.activeRunId === activeRunId) {
-                  throw Object.assign(new Error("Timed out cancelling the active ChatGPT backend turn"), { code: "timed_out" });
+                  throw Object.assign(new Error("Timed out waiting for the active ChatGPT backend turn to stop"), { code: "timed_out" });
                 }
               } catch (error) {
                 emit({
@@ -405,30 +422,14 @@ export function createChatGptCodexifyProvider() {
 
           case "session.close": {
             const session = sessions.get(input.sessionId);
-            try {
-              if (session) {
-                if (!session.persist) {
-                  if (session.activeRunId) {
-                    try {
-                      await controller({
-                        op: "cancel",
-                        session_id: session.backendSessionId,
-                        run_id: session.activeRunId,
-                        reason: "Paseo session closed",
-                      });
-                    } catch {}
-                  }
-                  if (!session.activeRunId) {
-                    await controller({ op: "finish", session_id: session.backendSessionId });
-                  }
-                }
-                session.closed = true;
-                sessions.delete(input.sessionId);
-              }
-              emit({ type: "session.closed", sessionId: input.sessionId });
-            } catch (error) {
-              emit({ type: "session.closed", sessionId: input.sessionId, error: providerError(error) });
+            // Closing a Paseo runtime is only a transport detach. The attached
+            // ChatGPT backend session is durable and may be restored immediately.
+            // Cancellation is handled explicitly by session.interrupt.
+            if (session) {
+              session.closed = true;
+              sessions.delete(input.sessionId);
             }
+            emit({ type: "session.closed", sessionId: input.sessionId });
             return;
           }
 
