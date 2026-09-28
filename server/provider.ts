@@ -184,6 +184,7 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
             return await callController<any>({
               op: "dispatch",
               workspace,
+              rebind: true,
               prompt,
             });
           } catch (error) {
@@ -201,10 +202,7 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
           const status = await callController<any>({ op: "status", session_id: restoredSessionId });
           const restored = status?.session;
           if (restored?.workspace?.active_root && restored.workspace.active_root !== workspace) {
-            throw Object.assign(
-              new Error(`ChatGPT backend workspace mismatch: ${restored.workspace.active_root}`),
-              { code: "conflict" },
-            );
+            return null;
           }
           return restored?.live ? restored : null;
         } catch (error) {
@@ -233,13 +231,9 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
           try {
             const status = await callController<any>({ op: "status", session_id: session.backendSessionId });
             const current = status?.session;
-            if (current?.workspace?.active_root && current.workspace.active_root !== session.cwd) {
-              throw Object.assign(
-                new Error(`ChatGPT backend workspace mismatch: ${current.workspace.active_root}`),
-                { code: "conflict" },
-              );
-            }
-            if (current?.live && current.accepting_tasks !== false) {
+            const workspaceMatches =
+              !current?.workspace?.active_root || current.workspace.active_root === session.cwd;
+            if (workspaceMatches && current?.live && current.accepting_tasks !== false) {
               try {
                 return await callController<any>({
                   op: "submit",

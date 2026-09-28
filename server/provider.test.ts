@@ -79,6 +79,7 @@ test("stale persisted worker opens unbound and dispatches the next prompt atomic
     }
     if (request.op === "dispatch") {
       assert.equal(request.workspace, "/workspace");
+      assert.equal(request.rebind, true);
       assert.equal(request.prompt, "work");
       return { session_id: "healthy", run_id: "run-1", state: "queued" };
     }
@@ -119,6 +120,53 @@ test("stale persisted worker opens unbound and dispatches the next prompt atomic
   await connection.close();
 });
 
+test("persisted live worker rebound elsewhere opens unbound and rebinds on prompt", async () => {
+  const calls: any[] = [];
+  const { connection, events } = await connectedProvider(async (request) => {
+    calls.push(request);
+    if (request.op === "status") {
+      return { session: session("worker-a", "/other-workspace") };
+    }
+    if (request.op === "dispatch") {
+      assert.equal(request.workspace, "/workspace");
+      assert.equal(request.rebind, true);
+      return { session_id: "worker-a", run_id: "run-rebound", state: "queued" };
+    }
+    if (request.op === "wait") return { state: "succeeded", result: "REBOUND" };
+    throw new Error(`unexpected op ${request.op}`);
+  });
+
+  await connection.send({
+    type: "session.open",
+    requestId: "open-rebound-elsewhere",
+    sessionId: "provider-session",
+    persistence: { version: 1, data: { backendSessionId: "worker-a", cwd: "/workspace" } },
+    config: { cwd: "/workspace", persist: true },
+  });
+
+  const opened = events.find((event) => event.type === "session.opened");
+  assert.equal(opened?.persistence?.data?.backendSessionId, undefined);
+
+  await connection.send({
+    type: "session.prompt",
+    sessionId: "provider-session",
+    prompt: {
+      clientMessageId: "message-rebound-elsewhere",
+      delivery: "auto",
+      input: { type: "message", content: [{ type: "text", text: "work here" }] },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.deepEqual(calls.map((request) => request.op).slice(0, 3), ["status", "dispatch", "wait"]);
+  assert.equal(
+    events.filter((event) => event.type === "session.persistence").at(-1)?.persistence?.data?.backendSessionId,
+    "worker-a",
+  );
+  assert.ok(events.some((event) => event.type === "timeline.item" && event.item?.text === "REBOUND"));
+  await connection.close();
+});
+
 test("fresh session does not reserve a worker before its first prompt", async () => {
   const calls: any[] = [];
   const { connection, events } = await connectedProvider(async (request) => {
@@ -155,6 +203,7 @@ test("fresh session does not reserve a worker before its first prompt", async ()
 
   assert.equal(calls[0]?.op, "dispatch");
   assert.equal(calls[0]?.workspace, "/workspace");
+  assert.equal(calls[0]?.rebind, true);
   assert.equal(calls[0]?.prompt, "first");
   assert.ok(!calls.some((request) => request.op === "acquire" || request.op === "submit"));
   assert.equal(
