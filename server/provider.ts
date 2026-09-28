@@ -22,7 +22,7 @@ export type ChatGptCodexifyProviderOptions = {
 };
 
 type SessionState = {
-  backendSessionId: string;
+  backendSessionId: string | null;
   cwd: string;
   activeRunId: string | null;
   activeTurnId: string | null;
@@ -92,7 +92,7 @@ function persistenceHandle(session: SessionState) {
   return {
     version: 1,
     data: {
-      backendSessionId: session.backendSessionId,
+      ...(session.backendSessionId ? { backendSessionId: session.backendSessionId } : {}),
       cwd: session.cwd,
     },
   };
@@ -177,13 +177,14 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
         for (const listener of listeners) listener(event);
       };
 
-      const acquireAvailableBackend = async (workspace?: string) => {
+      const dispatchAvailableBackend = async (workspace: string, prompt: string) => {
         const deadline = Date.now() + Math.max(0, acquireRetryMs);
         for (;;) {
           try {
             return await callController<any>({
-              op: "acquire",
-              ...(workspace ? { workspace } : {}),
+              op: "dispatch",
+              workspace,
+              prompt,
             });
           } catch (error) {
             if ((error as ControllerError)?.code !== "unavailable" || Date.now() >= deadline) {
@@ -194,35 +195,28 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
         }
       };
 
-      const resolveBackendSession = async (workspace: string, restoredSessionId: string | null) => {
-        if (restoredSessionId) {
-          try {
-            const status = await callController<any>({ op: "status", session_id: restoredSessionId });
-            const restored = status?.session;
-            if (restored?.workspace?.active_root && restored.workspace.active_root !== workspace) {
-              throw Object.assign(
-                new Error(`ChatGPT backend workspace mismatch: ${restored.workspace.active_root}`),
-                { code: "conflict" },
-              );
-            }
-            if (restored?.live) return restored;
-          } catch (error) {
-            const code = (error as ControllerError)?.code;
-            if (code !== "not_found" && code !== "unavailable") throw error;
+      const resolveRestoredBackendSession = async (workspace: string, restoredSessionId: string | null) => {
+        if (!restoredSessionId) return null;
+        try {
+          const status = await callController<any>({ op: "status", session_id: restoredSessionId });
+          const restored = status?.session;
+          if (restored?.workspace?.active_root && restored.workspace.active_root !== workspace) {
+            throw Object.assign(
+              new Error(`ChatGPT backend workspace mismatch: ${restored.workspace.active_root}`),
+              { code: "conflict" },
+            );
           }
+          return restored?.live ? restored : null;
+        } catch (error) {
+          const code = (error as ControllerError)?.code;
+          if (code !== "not_found" && code !== "unavailable") throw error;
+          return null;
         }
-        return await acquireAvailableBackend(workspace);
       };
 
-      const rebindAvailableBackend = async (providerSessionId: string, session: SessionState) => {
-        const replacement = await acquireAvailableBackend(session.cwd);
-        if (replacement.workspace?.active_root && replacement.workspace.active_root !== session.cwd) {
-          throw Object.assign(
-            new Error(`ChatGPT backend workspace mismatch: ${replacement.workspace.active_root}`),
-            { code: "conflict" },
-          );
-        }
-        session.backendSessionId = replacement.session_id;
+      const bindBackendSession = (providerSessionId: string, session: SessionState, backendSessionId: string) => {
+        if (session.backendSessionId === backendSessionId) return;
+        session.backendSessionId = backendSessionId;
         session.activeRunId = null;
         session.activeTurnId = null;
         if (session.persist) {
@@ -232,31 +226,51 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
             persistence: persistenceHandle(session),
           });
         }
-        return replacement;
       };
 
-      const ensureAvailableBackend = async (providerSessionId: string, session: SessionState) => {
-        try {
-          const status = await callController<any>({ op: "status", session_id: session.backendSessionId });
-          const current = status?.session;
-          if (current?.workspace?.active_root && current.workspace.active_root !== session.cwd) {
-            throw Object.assign(
-              new Error(`ChatGPT backend workspace mismatch: ${current.workspace.active_root}`),
-              { code: "conflict" },
-            );
+      const submitPrompt = async (providerSessionId: string, session: SessionState, prompt: string) => {
+        if (session.backendSessionId) {
+          try {
+            const status = await callController<any>({ op: "status", session_id: session.backendSessionId });
+            const current = status?.session;
+            if (current?.workspace?.active_root && current.workspace.active_root !== session.cwd) {
+              throw Object.assign(
+                new Error(`ChatGPT backend workspace mismatch: ${current.workspace.active_root}`),
+                { code: "conflict" },
+              );
+            }
+            if (current?.live && current.accepting_tasks !== false) {
+              try {
+                return await callController<any>({
+                  op: "submit",
+                  session_id: session.backendSessionId,
+                  prompt,
+                });
+              } catch (error) {
+                if (!isRecoverableBackendError(error)) throw error;
+              }
+            }
+          } catch (error) {
+            if (!isRecoverableBackendError(error)) throw error;
           }
-          if (current?.live && current.accepting_tasks !== false) return current;
-        } catch (error) {
-          if (!isRecoverableBackendError(error)) throw error;
         }
-        return await rebindAvailableBackend(providerSessionId, session);
+
+        const run = await dispatchAvailableBackend(session.cwd, prompt);
+        bindBackendSession(providerSessionId, session, run.session_id);
+        return run;
       };
 
-      const waitForRun = async (providerSessionId: string, session: SessionState, runId: string, turnId: string) => {
+      const waitForRun = async (
+        providerSessionId: string,
+        session: SessionState,
+        backendSessionId: string,
+        runId: string,
+        turnId: string,
+      ) => {
         const toolStates = new Map<number, string>();
         const emitToolProgress = async () => {
           try {
-            const status = await callController<any>({ op: "status", session_id: session.backendSessionId });
+            const status = await callController<any>({ op: "status", session_id: backendSessionId });
             const taskSeq = Array.isArray(status?.tasks) ? status.tasks.at(-1)?.command_seq : null;
             if (typeof taskSeq !== "number" || !Array.isArray(status?.timeline)) return;
 
@@ -304,7 +318,7 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
             try {
               const run = await callController<any>({
                 op: "wait",
-                session_id: session.backendSessionId,
+                session_id: backendSessionId,
                 run_id: runId,
                 timeout_ms: PROGRESS_POLL_MS,
               });
@@ -382,9 +396,10 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
         switch (input.type) {
           case "catalog": {
             try {
-              await acquireAvailableBackend(
-                typeof input.cwd === "string" && input.cwd ? input.cwd : undefined,
-              );
+              await callController({
+                op: "pool",
+                ...(typeof input.cwd === "string" && input.cwd ? { workspace: input.cwd } : {}),
+              });
               emit({
                 type: "catalog",
                 requestId: input.requestId,
@@ -404,15 +419,12 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
           case "session.open": {
             const restoredSessionId = restoredBackendSessionId(input.persistence);
             try {
-              const backendSession = await resolveBackendSession(input.config.cwd, restoredSessionId);
-              if (backendSession.workspace?.active_root && backendSession.workspace.active_root !== input.config.cwd) {
-                throw Object.assign(new Error(`ChatGPT backend workspace mismatch: ${backendSession.workspace.active_root}`), { code: "conflict" });
-              }
+              const backendSession = await resolveRestoredBackendSession(input.config.cwd, restoredSessionId);
               const state: SessionState = {
-                backendSessionId: backendSession.session_id,
+                backendSessionId: backendSession?.session_id ?? null,
                 cwd: input.config.cwd,
-                activeRunId: backendSession.active_run_id ?? null,
-                activeTurnId: backendSession.active_run_id ?? null,
+                activeRunId: backendSession?.active_run_id ?? null,
+                activeTurnId: backendSession?.active_run_id ?? null,
                 closed: false,
                 persist: input.config.persist,
               };
@@ -440,7 +452,8 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
               });
               emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
               if (state.activeRunId && state.activeTurnId) {
-                void waitForRun(input.sessionId, state, state.activeRunId, state.activeTurnId);
+                if (!state.backendSessionId) throw new Error("Restored active ChatGPT backend run has no backend session");
+                void waitForRun(input.sessionId, state, state.backendSessionId, state.activeRunId, state.activeTurnId);
               }
             } catch (error) {
               emit({ type: "request.failed", requestId: input.requestId, error: providerError(error) });
@@ -453,6 +466,7 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
             if (!session || session.closed) throw new Error(`Unknown provider session ${input.sessionId}`);
             if (session.activeRunId && session.activeTurnId) {
               try {
+                if (!session.backendSessionId) throw new Error("Active ChatGPT backend turn has no backend session");
                 const instruction = promptText(input.prompt.input);
                 await callController({
                   op: "steer",
@@ -500,23 +514,9 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
 
             try {
               const text = promptText(input.prompt.input);
-              await ensureAvailableBackend(input.sessionId, session);
-              let run;
-              try {
-                run = await callController<any>({
-                  op: "submit",
-                  session_id: session.backendSessionId,
-                  prompt: text,
-                });
-              } catch (error) {
-                if (!isRecoverableBackendError(error)) throw error;
-                await rebindAvailableBackend(input.sessionId, session);
-                run = await callController<any>({
-                  op: "submit",
-                  session_id: session.backendSessionId,
-                  prompt: text,
-                });
-              }
+              const run = await submitPrompt(input.sessionId, session, text);
+              if (!session.backendSessionId) throw new Error("ChatGPT backend dispatch did not bind a backend session");
+              const backendSessionId = session.backendSessionId;
               const turnId = run.run_id as string;
               session.activeRunId = run.run_id;
               session.activeTurnId = turnId;
@@ -538,7 +538,7 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
                 },
                 timestamp: new Date().toISOString(),
               });
-              void waitForRun(input.sessionId, session, run.run_id, turnId);
+              void waitForRun(input.sessionId, session, backendSessionId, run.run_id, turnId);
             } catch (error) {
               emit({
                 type: "session.prompt_result",
@@ -555,6 +555,7 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
             try {
               const runId = session?.activeRunId ?? null;
               if (session && runId) {
+                if (!session.backendSessionId) throw new Error("Active ChatGPT backend turn has no backend session");
                 interruptedRunIds.add(runId);
                 try {
                   await callController({
