@@ -150,6 +150,92 @@ function toolCallStatus(entry: any): "running" | "completed" | "failed" | "cance
   }
 }
 
+function parsePreview(value: unknown): any {
+  if (typeof value !== "string" || !value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function previewText(value: any): string | undefined {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return undefined;
+  const structured = value.structuredContent?.upstream_result ?? value.structuredContent;
+  if (typeof structured?.output === "string") return structured.output;
+  if (typeof structured?.content === "string") return structured.content;
+  if (Array.isArray(value.content)) {
+    const text = value.content
+      .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+      .map((part: any) => part.text)
+      .join("\n");
+    if (text) return text;
+  }
+  return undefined;
+}
+
+function toolCallDetail(tool: string, entry: any): any {
+  const input = parsePreview(entry.request_preview);
+  const response = parsePreview(entry.response_preview);
+
+  if (tool === "exec_command" && input && typeof input === "object" && typeof input.cmd === "string") {
+    const structured = response?.structuredContent?.upstream_result ?? response?.structuredContent;
+    const output = typeof structured?.output === "string" ? structured.output : previewText(response);
+    return {
+      type: "shell",
+      command: input.cmd,
+      ...(typeof input.workdir === "string" && input.workdir ? { cwd: input.workdir } : {}),
+      ...(output ? { output } : {}),
+      ...(typeof structured?.exit_code === "number" ? { exitCode: structured.exit_code } : {}),
+    };
+  }
+
+  if (tool === "read_file" && input && typeof input === "object" && typeof input.path === "string") {
+    const content = previewText(response);
+    return {
+      type: "read",
+      filePath: input.path,
+      ...(typeof input.offset === "number" ? { offset: input.offset } : {}),
+      ...(typeof input.limit === "number" ? { limit: input.limit } : {}),
+      ...(content ? { content } : {}),
+    };
+  }
+
+  if (tool === "write_file" && input && typeof input === "object" && typeof input.path === "string") {
+    return {
+      type: "write",
+      filePath: input.path,
+      ...(typeof input.content === "string" ? { content: input.content } : {}),
+    };
+  }
+
+  if (tool === "git_status") {
+    const text = previewText(response);
+    return {
+      type: "plain_text",
+      label: "Git status",
+      ...(text ? { text } : {}),
+      icon: "eye",
+    };
+  }
+
+  const details = [
+    typeof entry.request_preview === "string" && entry.request_preview
+      ? "Input\n" + entry.request_preview
+      : null,
+    typeof entry.response_preview === "string" && entry.response_preview
+      ? "Output\n" + entry.response_preview
+      : null,
+  ].filter(Boolean);
+  return {
+    type: "plain_text",
+    label: tool,
+    ...(details.length ? { text: details.join("\n\n") } : {}),
+    icon: "wrench",
+  };
+}
+
 export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOptions = {}) {
   const callController = options.controller ?? controller;
   const acquireRetryMs = options.acquireRetryMs ?? ACQUIRE_RETRY_MS;
@@ -290,7 +376,7 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
                   type: "tool_call",
                   callId: itemId,
                   name: tool,
-                  detail: { type: "plain_text", label: tool, icon: "wrench" },
+                  detail: toolCallDetail(tool, entry),
                   status: nextState,
                   error: nextState === "failed" ? { message: `${tool} failed` } : null,
                   metadata: {

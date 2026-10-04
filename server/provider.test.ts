@@ -492,6 +492,10 @@ test("active run publishes backend tool timeline as live Paseo tool progress", a
     command_seq: 3,
     tool: "exec_command",
     tool_status: "running",
+    request_preview: JSON.stringify({
+      cmd: "git status --short --branch",
+      workdir: "repo",
+    }),
   };
   const toolCompleted = {
     at_ms: 1_250,
@@ -501,6 +505,15 @@ test("active run publishes backend tool timeline as live Paseo tool progress", a
     tool: "exec_command",
     tool_status: "succeeded",
     duration_ms: 250,
+    request_preview: toolStarted.request_preview,
+    response_preview: JSON.stringify({
+      content: [{ type: "text", text: "## main...origin/main\n" }],
+      isError: false,
+      structuredContent: {
+        output: "## main...origin/main\n",
+        exit_code: 0,
+      },
+    }),
   };
   const { connection, events } = await connectedProvider(async (request) => {
     if (request.op === "dispatch") return { session_id: "healthy", run_id: "run-3", state: "queued" };
@@ -542,6 +555,18 @@ test("active run publishes backend tool timeline as live Paseo tool progress", a
   assert.equal(toolEvents[0]?.item.id, toolEvents[1]?.item.id);
   assert.equal(toolEvents[0]?.item.callId, toolEvents[1]?.item.callId);
   assert.equal(toolEvents[0]?.item.name, "exec_command");
+  assert.deepEqual(toolEvents[0]?.item.detail, {
+    type: "shell",
+    command: "git status --short --branch",
+    cwd: "repo",
+  });
+  assert.deepEqual(toolEvents[1]?.item.detail, {
+    type: "shell",
+    command: "git status --short --branch",
+    cwd: "repo",
+    output: "## main...origin/main\n",
+    exitCode: 0,
+  });
   assert.equal(toolEvents[1]?.item.metadata?.durationMs, 250);
   assert.equal(toolEvents[1]?.timestamp, new Date(1_250).toISOString());
   assert.ok(events.some((event) => event.type === "timeline.item" && event.item?.text === "DONE"));
