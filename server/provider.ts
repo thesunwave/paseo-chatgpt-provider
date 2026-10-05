@@ -175,22 +175,111 @@ function previewText(value: any): string | undefined {
   return undefined;
 }
 
-function toolCallDetail(tool: string, entry: any): any {
-  const input = parsePreview(entry.request_preview);
-  const response = parsePreview(entry.response_preview);
+function toolResultPayload(value: any): any {
+  if (typeof value === "string") {
+    const parsed = parsePreview(value);
+    return parsed === value ? null : toolResultPayload(parsed);
+  }
+  if (!value || typeof value !== "object") return null;
+  if (value.upstream_result && typeof value.upstream_result === "object") {
+    return toolResultPayload(value.upstream_result) ?? value.upstream_result;
+  }
+  if (value.structuredContent && typeof value.structuredContent === "object") {
+    return toolResultPayload(value.structuredContent) ?? value.structuredContent;
+  }
+  if (
+    typeof value.output === "string" ||
+    typeof value.exit_code === "number" ||
+    typeof value.exitCode === "number" ||
+    value.session_id !== undefined ||
+    value.sessionId !== undefined
+  ) {
+    return value;
+  }
+  if (Array.isArray(value.content)) {
+    for (const part of value.content) {
+      if (part?.type !== "text" || typeof part.text !== "string") continue;
+      const parsed = toolResultPayload(part.text);
+      if (parsed) return parsed;
+    }
+  }
+  return null;
+}
 
-  if (tool === "exec_command" && input && typeof input === "object" && typeof input.cmd === "string") {
-    const structured = response?.structuredContent?.upstream_result ?? response?.structuredContent;
-    const output = typeof structured?.output === "string" ? structured.output : previewText(response);
+function normalizedToolResult(entry: any) {
+  const response = parsePreview(entry.response_preview);
+  const payload = toolResultPayload(response);
+  const output =
+    typeof payload?.output === "string"
+      ? payload.output
+      : typeof payload?.content === "string"
+        ? payload.content
+        : previewText(response);
+  const exitCode =
+    typeof payload?.exit_code === "number"
+      ? payload.exit_code
+      : typeof payload?.exitCode === "number"
+        ? payload.exitCode
+        : undefined;
+  const sessionId = payload?.session_id ?? payload?.sessionId;
+  return {
+    output,
+    exitCode,
+    sessionId: typeof sessionId === "string" || typeof sessionId === "number" ? sessionId : undefined,
+  };
+}
+
+function compactShellSummary(command: string): string {
+  const line =
+    command
+      .split("\n")
+      .map((value) => value.trim())
+      .find((value) => value && !/^set\s+[+-]/.test(value) && !/^[A-Z_][A-Z0-9_]*=/.test(value)) ??
+    command.trim().split("\n")[0] ??
+    "command";
+  return line.length <= 96 ? line : line.slice(0, 93) + "...";
+}
+
+function shellDetail(
+  command: string,
+  cwd: string | undefined,
+  output: string | undefined,
+  exitCode: number | undefined,
+  failed: boolean,
+): any {
+  if (!command.includes("\n") && command.length <= 120) {
     return {
       type: "shell",
-      command: input.cmd,
-      ...(typeof input.workdir === "string" && input.workdir ? { cwd: input.workdir } : {}),
+      command,
+      ...(cwd ? { cwd } : {}),
       ...(output ? { output } : {}),
-      ...(typeof structured?.exit_code === "number" ? { exitCode: structured.exit_code } : {}),
+      ...(exitCode !== undefined ? { exitCode } : {}),
     };
   }
+  const body = ["$ " + command, output ? output : null].filter(Boolean).join("\n\n");
+  return {
+    type: "plain_text",
+    label: compactShellSummary(command),
+    text: body,
+    icon: "square_terminal",
+  };
+}
 
+function toolCallDetail(tool: string, entry: any): any {
+  const input = parsePreview(entry.request_preview);
+
+  if (tool === "exec_command" && input && typeof input === "object" && typeof input.cmd === "string") {
+    const result = normalizedToolResult(entry);
+    return shellDetail(
+      input.cmd,
+      typeof input.workdir === "string" && input.workdir ? input.workdir : undefined,
+      result.output,
+      result.exitCode,
+      entry.tool_status === "failed" || (result.exitCode !== undefined && result.exitCode !== 0),
+    );
+  }
+
+  const response = parsePreview(entry.response_preview);
   if (tool === "read_file" && input && typeof input === "object" && typeof input.path === "string") {
     const content = previewText(response);
     return {
@@ -234,6 +323,15 @@ function toolCallDetail(tool: string, entry: any): any {
     ...(details.length ? { text: details.join("\n\n") } : {}),
     icon: "wrench",
   };
+}
+
+function failedToolError(tool: string, entry: any): any {
+  const result = normalizedToolResult(entry);
+  const message =
+    result.exitCode !== undefined
+      ? `Process exited with code ${result.exitCode}`
+      : result.output?.trim() || `${tool} failed`;
+  return { content: message };
 }
 
 export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOptions = {}) {
@@ -347,7 +445,12 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
         runId: string,
         turnId: string,
       ) => {
-        const toolStates = new Map<number, string>();
+        const toolSnapshots = new Map<string, string>();
+        const processedShellChunks = new Set<number>();
+        const shellProcesses = new Map<
+          string,
+          { itemId: string; command: string; cwd?: string; output: string; terminal: boolean }
+        >();
         const emitToolProgress = async () => {
           try {
             const status = await callController<any>({ op: "status", session_id: backendSessionId });
@@ -363,11 +466,101 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
             }
 
             for (const [seq, entry] of [...latestBySeq.entries()].sort(([a], [b]) => a - b)) {
-              const nextState = toolCallStatus(entry);
               const tool = typeof entry.tool === "string" && entry.tool ? entry.tool : "tool";
-              if (!nextState || toolStates.get(seq) === nextState) continue;
-              toolStates.set(seq, nextState);
-              const itemId = `tool-${turnId}-${seq}`;
+              let nextState = toolCallStatus(entry);
+              if (!nextState) continue;
+
+              let itemId = `tool-${turnId}-${seq}`;
+              let name = tool === "exec_command" ? "shell" : tool;
+              let detail = toolCallDetail(tool, entry);
+              let error = nextState === "failed" ? failedToolError(tool, entry) : null;
+
+              if (tool === "exec_command") {
+                const input = parsePreview(entry.request_preview);
+                const result = normalizedToolResult(entry);
+                const command = typeof input?.cmd === "string" ? input.cmd : null;
+                const cwd = typeof input?.workdir === "string" && input.workdir ? input.workdir : undefined;
+                if (command && entry.kind === "tool_completed") {
+                  if (result.exitCode !== undefined) {
+                    nextState = result.exitCode === 0 ? "completed" : "failed";
+                    error = nextState === "failed" ? failedToolError(tool, entry) : null;
+                  } else if (result.sessionId !== undefined) {
+                    const processKey = String(result.sessionId);
+                    let process = shellProcesses.get(processKey);
+                    if (!process) {
+                      process = { itemId, command, cwd, output: "", terminal: false };
+                      shellProcesses.set(processKey, process);
+                    } else if (process.terminal) {
+                      continue;
+                    }
+                    if (!processedShellChunks.has(seq) && result.output) {
+                      process.output += result.output;
+                      processedShellChunks.add(seq);
+                    }
+                    nextState = "running";
+                    detail = shellDetail(command, cwd, process.output || undefined, undefined, false);
+                    error = null;
+                  }
+                }
+              } else if (tool === "write_stdin") {
+                const input = parsePreview(entry.request_preview);
+                const processKey =
+                  typeof input?.session_id === "string" || typeof input?.session_id === "number"
+                    ? String(input.session_id)
+                    : null;
+                const process = processKey ? shellProcesses.get(processKey) : null;
+                if (entry.kind === "tool_started" && process) continue;
+
+                const result = normalizedToolResult(entry);
+                if (process) {
+                  if (!processedShellChunks.has(seq) && result.output) {
+                    process.output += result.output;
+                    processedShellChunks.add(seq);
+                  }
+                  itemId = process.itemId;
+                  name = "shell";
+                  if (result.exitCode !== undefined) {
+                    nextState = result.exitCode === 0 ? "completed" : "failed";
+                  } else if (result.sessionId !== undefined) {
+                    nextState = "running";
+                  }
+                  detail = shellDetail(
+                    process.command,
+                    process.cwd,
+                    process.output || undefined,
+                    result.exitCode,
+                    nextState === "failed",
+                  );
+                  error =
+                    nextState === "failed"
+                      ? {
+                          content:
+                            result.exitCode !== undefined
+                              ? `Process exited with code ${result.exitCode}`
+                              : process.output.trim() || "shell process failed",
+                        }
+                      : null;
+                  if (result.sessionId !== undefined && result.exitCode === undefined) {
+                    shellProcesses.set(String(result.sessionId), process);
+                  }
+                  if (result.exitCode !== undefined && processKey) {
+                    process.terminal = true;
+                  }
+                } else {
+                  name = "shell";
+                  detail = {
+                    type: "plain_text",
+                    label: processKey ? `process ${processKey}` : "process output",
+                    ...(result.output ? { text: result.output } : {}),
+                    icon: "square_terminal",
+                  };
+                  error = nextState === "failed" ? failedToolError(tool, entry) : null;
+                }
+              }
+
+              const signature = JSON.stringify({ nextState, detail, error });
+              if (toolSnapshots.get(itemId) === signature) continue;
+              toolSnapshots.set(itemId, signature);
               emit({
                 type: "timeline.item",
                 sessionId: providerSessionId,
@@ -375,13 +568,14 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
                   id: itemId,
                   type: "tool_call",
                   callId: itemId,
-                  name: tool,
-                  detail: toolCallDetail(tool, entry),
+                  name,
+                  detail,
                   status: nextState,
-                  error: nextState === "failed" ? { message: `${tool} failed` } : null,
+                  error,
                   metadata: {
                     backendToolSeq: seq,
                     backendTaskSeq: taskSeq,
+                    backendTool: tool,
                     ...(typeof entry.duration_ms === "number" ? { durationMs: entry.duration_ms } : {}),
                   },
                 },

@@ -554,7 +554,7 @@ test("active run publishes backend tool timeline as live Paseo tool progress", a
   assert.deepEqual(toolEvents.map((event) => event.item.status), ["running", "completed"]);
   assert.equal(toolEvents[0]?.item.id, toolEvents[1]?.item.id);
   assert.equal(toolEvents[0]?.item.callId, toolEvents[1]?.item.callId);
-  assert.equal(toolEvents[0]?.item.name, "exec_command");
+  assert.equal(toolEvents[0]?.item.name, "shell");
   assert.deepEqual(toolEvents[0]?.item.detail, {
     type: "shell",
     command: "git status --short --branch",
@@ -571,6 +571,170 @@ test("active run publishes backend tool timeline as live Paseo tool progress", a
   assert.equal(toolEvents[1]?.timestamp, new Date(1_250).toISOString());
   assert.ok(events.some((event) => event.type === "timeline.item" && event.item?.text === "DONE"));
   assert.ok(events.some((event) => event.type === "session.turn" && event.turnId === "run-3" && event.state === "completed"));
+  await connection.close();
+});
+
+test("long-running shell folds write_stdin progress into the original tool call", async () => {
+  let waitCalls = 0;
+  const command = "npm test -- --runInBand";
+  const execCompleted = {
+    at_ms: 1_000,
+    kind: "tool_completed",
+    seq: 11,
+    command_seq: 4,
+    tool: "exec_command",
+    tool_status: "succeeded",
+    request_preview: JSON.stringify({ cmd: command, yield_time_ms: 1_000 }),
+    response_preview: JSON.stringify({
+      structuredContent: {
+        session_id: 2,
+        output: "starting tests\n",
+      },
+    }),
+  };
+  const writeCompleted = {
+    at_ms: 1_500,
+    kind: "tool_completed",
+    seq: 12,
+    command_seq: 4,
+    tool: "write_stdin",
+    tool_status: "succeeded",
+    duration_ms: 500,
+    request_preview: JSON.stringify({ session_id: 2, yield_time_ms: 1_000 }),
+    response_preview: JSON.stringify({
+      content: [{ type: "text", text: JSON.stringify({ exit_code: 0, output: "all green\n" }) }],
+      structuredContent: {
+        exit_code: 0,
+        output: "all green\n",
+      },
+    }),
+  };
+
+  const { connection, events } = await connectedProvider(async (request) => {
+    if (request.op === "dispatch") return { session_id: "healthy", run_id: "run-shell", state: "queued" };
+    if (request.op === "wait") {
+      waitCalls += 1;
+      if (waitCalls < 3) throw timedOut();
+      return { state: "succeeded", result: "DONE" };
+    }
+    if (request.op === "status") {
+      return {
+        session: session("healthy", "/workspace", { state: "working", active_run_id: "run-shell" }),
+        tasks: [{ command_seq: 4 }],
+        timeline: waitCalls === 1 ? [execCompleted] : [execCompleted, writeCompleted],
+      };
+    }
+    throw new Error(`unexpected op ${request.op}`);
+  });
+
+  await connection.send({
+    type: "session.open",
+    requestId: "open-shell",
+    sessionId: "provider-session",
+    config: { cwd: "/workspace", persist: true },
+  });
+  await connection.send({
+    type: "session.prompt",
+    sessionId: "provider-session",
+    prompt: {
+      clientMessageId: "message-shell",
+      delivery: "auto",
+      input: { type: "message", content: [{ type: "text", text: "run tests" }] },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  const toolEvents = events.filter((event) => event.type === "timeline.item" && event.item?.type === "tool_call");
+  for (const event of toolEvents) ProviderEventSchema.parse(event);
+  assert.deepEqual(toolEvents.map((event) => event.item.status), ["running", "completed"]);
+  assert.equal(toolEvents[0]?.item.id, toolEvents[1]?.item.id);
+  assert.equal(toolEvents[0]?.item.name, "shell");
+  assert.equal(toolEvents[1]?.item.name, "shell");
+  assert.deepEqual(toolEvents[1]?.item.detail, {
+    type: "shell",
+    command,
+    output: "starting tests\nall green\n",
+    exitCode: 0,
+  });
+  assert.ok(!toolEvents.some((event) => event.item.name === "write_stdin"));
+  await connection.close();
+});
+
+test("failed multiline shell uses a compact title and meaningful error text", async () => {
+  let waitCalls = 0;
+  const command = [
+    "set -e",
+    "printf 'ok\\n'",
+    "false",
+    "printf 'unreachable\\n'",
+  ].join("\n");
+  const completed = {
+    at_ms: 2_000,
+    kind: "tool_completed",
+    seq: 20,
+    command_seq: 5,
+    tool: "exec_command",
+    tool_status: "failed",
+    request_preview: JSON.stringify({ cmd: command }),
+    response_preview: JSON.stringify({
+      content: [{ type: "text", text: "wrapper text that should not be shown" }],
+      isError: true,
+      structuredContent: {
+        exit_code: 1,
+        output: "ok\n",
+      },
+    }),
+  };
+  const { connection, events } = await connectedProvider(async (request) => {
+    if (request.op === "dispatch") return { session_id: "healthy", run_id: "run-failed-shell", state: "queued" };
+    if (request.op === "wait") {
+      waitCalls += 1;
+      if (waitCalls === 1) throw timedOut();
+      return { state: "succeeded", result: "DONE" };
+    }
+    if (request.op === "status") {
+      return {
+        session: session("healthy", "/workspace", { state: "working", active_run_id: "run-failed-shell" }),
+        tasks: [{ command_seq: 5 }],
+        timeline: [completed],
+      };
+    }
+    throw new Error(`unexpected op ${request.op}`);
+  });
+
+  await connection.send({
+    type: "session.open",
+    requestId: "open-failed-shell",
+    sessionId: "provider-session",
+    config: { cwd: "/workspace", persist: true },
+  });
+  await connection.send({
+    type: "session.prompt",
+    sessionId: "provider-session",
+    prompt: {
+      clientMessageId: "message-failed-shell",
+      delivery: "auto",
+      input: { type: "message", content: [{ type: "text", text: "inspect" }] },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const failed = events.find(
+    (event) => event.type === "timeline.item" && event.item?.type === "tool_call" && event.item.status === "failed",
+  );
+  ProviderEventSchema.parse(failed);
+  assert.equal(failed?.item.name, "shell");
+  assert.equal(failed?.item.detail.type, "plain_text");
+  assert.equal(
+    failed?.item.detail.label,
+    "printf 'ok\\n'",
+  );
+  assert.match(failed?.item.detail.text, /^\$ set -e\n/);
+  assert.match(failed?.item.detail.text, /\n\nok\n$/);
+  assert.doesNotMatch(failed?.item.detail.text, /wrapper text/);
+  assert.deepEqual(failed?.item.error, {
+    content: "Process exited with code 1",
+  });
   await connection.close();
 });
 
