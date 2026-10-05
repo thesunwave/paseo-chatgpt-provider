@@ -297,6 +297,104 @@ test("restored active run resumes terminal watcher", async () => {
   await connection.close();
 });
 
+test("persisted timeline replays after provider restart even when the backend is gone", async () => {
+  let waitCalls = 0;
+  const toolStarted = {
+    at_ms: 1_000,
+    kind: "tool_started",
+    seq: 1,
+    command_seq: 1,
+    tool: "exec_command",
+    tool_status: "running",
+    request_preview: JSON.stringify({ cmd: "git status --short --branch" }),
+  };
+  const toolCompleted = {
+    ...toolStarted,
+    at_ms: 1_250,
+    kind: "tool_completed",
+    tool_status: "succeeded",
+    duration_ms: 250,
+    response_preview: JSON.stringify({
+      structuredContent: { output: "## main...origin/main\n", exit_code: 0 },
+    }),
+  };
+  const first = await connectedProvider(async (request) => {
+    if (request.op === "dispatch") {
+      return { session_id: "worker-history", run_id: "run-history", state: "queued" };
+    }
+    if (request.op === "wait") {
+      waitCalls += 1;
+      if (waitCalls === 1) throw timedOut();
+      return { state: "succeeded", result: "History survives." };
+    }
+    if (request.op === "status") {
+      return {
+        session: session("worker-history", "/workspace", {
+          state: "working",
+          active_run_id: "run-history",
+        }),
+        tasks: [{ command_seq: 1 }],
+        timeline: waitCalls === 1 ? [toolStarted] : [toolStarted, toolCompleted],
+      };
+    }
+    throw new Error(`unexpected op ${request.op}`);
+  });
+
+  await first.connection.send({
+    type: "session.open",
+    requestId: "open-history",
+    sessionId: "provider-session",
+    config: { cwd: "/workspace", persist: true },
+  });
+  await first.connection.send({
+    type: "session.prompt",
+    sessionId: "provider-session",
+    prompt: {
+      clientMessageId: "message-history",
+      delivery: "auto",
+      input: { type: "message", content: [{ type: "text", text: "remember this" }] },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  const saved = first.events
+    .filter((event) => event.type === "session.persistence")
+    .at(-1)?.persistence;
+  assert.equal(saved?.version, 2);
+  assert.deepEqual(
+    saved?.data?.timeline?.map((entry: any) => entry.item.type),
+    ["user_message", "tool_call", "assistant_message"],
+  );
+  assert.equal(saved?.data?.timeline?.[1]?.item.status, "completed");
+  await first.connection.close();
+
+  const restored = await connectedProvider(async (request) => {
+    if (request.op === "status") {
+      return { session: session("worker-history", "/workspace", { state: "stale", live: false }) };
+    }
+    throw new Error(`unexpected op ${request.op}`);
+  });
+  await restored.connection.send({
+    type: "session.open",
+    requestId: "reopen-history",
+    sessionId: "provider-session",
+    persistence: saved,
+    config: { cwd: "/workspace", persist: true },
+  });
+
+  const replayed = restored.events.filter((event) => event.type === "timeline.item");
+  for (const event of replayed) ProviderEventSchema.parse(event);
+  assert.deepEqual(
+    replayed.map((event) => [event.item.type, event.item.id]),
+    saved.data.timeline.map((entry: any) => [entry.item.type, entry.item.id]),
+  );
+  assert.equal(replayed[0]?.item.text, "remember this");
+  assert.equal(replayed[1]?.item.status, "completed");
+  assert.equal(replayed[2]?.item.text, "History survives.");
+  assert.ok(restored.events.findIndex((event) => event.type === "session.ready") > restored.events.findIndex((event) => event.type === "timeline.item"));
+  await restored.connection.close();
+});
+
 test("idle session rebinds from finished backend before the next prompt", async () => {
   let workerAFinished = false;
   const submissions: string[] = [];
