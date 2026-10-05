@@ -664,8 +664,9 @@ test("failed multiline shell uses a compact title and meaningful error text", as
   let waitCalls = 0;
   const command = [
     "set -e",
-    "git fetch origin main refs/pull/152/head:refs/remotes/origin/pr-152",
-    "git log -1 --oneline origin/main",
+    "printf 'ok\\n'",
+    "false",
+    "printf 'unreachable\\n'",
   ].join("\n");
   const completed = {
     at_ms: 2_000,
@@ -679,8 +680,8 @@ test("failed multiline shell uses a compact title and meaningful error text", as
       content: [{ type: "text", text: "wrapper text that should not be shown" }],
       isError: true,
       structuredContent: {
-        exit_code: 255,
-        output: "error: cannot open '.git/FETCH_HEAD': Permission denied\n",
+        exit_code: 1,
+        output: "ok\n",
       },
     }),
   };
@@ -726,12 +727,13 @@ test("failed multiline shell uses a compact title and meaningful error text", as
   assert.equal(failed?.item.detail.type, "plain_text");
   assert.equal(
     failed?.item.detail.label,
-    "git fetch origin main refs/pull/152/head:refs/remotes/origin/pr-152",
+    "printf 'ok\\n'",
   );
   assert.match(failed?.item.detail.text, /^\$ set -e\n/);
+  assert.match(failed?.item.detail.text, /\n\nok\n$/);
   assert.doesNotMatch(failed?.item.detail.text, /wrapper text/);
   assert.deepEqual(failed?.item.error, {
-    content: "error: cannot open '.git/FETCH_HEAD': Permission denied",
+    content: "Process exited with code 1",
   });
   await connection.close();
 });

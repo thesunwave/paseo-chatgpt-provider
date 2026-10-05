@@ -252,11 +252,11 @@ function shellDetail(
       type: "shell",
       command,
       ...(cwd ? { cwd } : {}),
-      ...(!failed && output ? { output } : {}),
+      ...(output ? { output } : {}),
       ...(exitCode !== undefined ? { exitCode } : {}),
     };
   }
-  const body = ["$ " + command, !failed && output ? output : null].filter(Boolean).join("\n\n");
+  const body = ["$ " + command, output ? output : null].filter(Boolean).join("\n\n");
   return {
     type: "plain_text",
     label: compactShellSummary(command),
@@ -327,7 +327,10 @@ function toolCallDetail(tool: string, entry: any): any {
 
 function failedToolError(tool: string, entry: any): any {
   const result = normalizedToolResult(entry);
-  const message = result.output?.trim() || `${tool} failed`;
+  const message =
+    result.exitCode !== undefined
+      ? `Process exited with code ${result.exitCode}`
+      : result.output?.trim() || `${tool} failed`;
   return { content: message };
 }
 
@@ -530,7 +533,12 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
                   );
                   error =
                     nextState === "failed"
-                      ? { content: process.output.trim() || "shell process failed" }
+                      ? {
+                          content:
+                            result.exitCode !== undefined
+                              ? `Process exited with code ${result.exitCode}`
+                              : process.output.trim() || "shell process failed",
+                        }
                       : null;
                   if (result.sessionId !== undefined && result.exitCode === undefined) {
                     shellProcesses.set(String(result.sessionId), process);
