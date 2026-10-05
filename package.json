@@ -2,6 +2,7 @@
   "name": "chatgpt-codexify",
   "private": true,
   "version": "0.0.0",
+  "type": "module",
   "files": [
     "paseo-plugin.json",
     "index.client.ts",
@@ -9,6 +10,7 @@
     "index.server.ts",
     "index.server.tsx",
     "client/",
+    "docs/",
     "server/",
     "shared/"
   ],
