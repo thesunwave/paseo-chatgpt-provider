@@ -7,6 +7,7 @@ const INTERRUPT_GRACE_MS = 20_000;
 const ACQUIRE_RETRY_MS = 2_500;
 const ACQUIRE_RETRY_INTERVAL_MS = 100;
 const PROGRESS_POLL_MS = 500;
+const PERSISTENCE_VERSION = 2;
 const SUPPORTED_CAPABILITIES = ["prompt.message", "prompt.steer", "session.persistence"] as const;
 
 type JsonRecord = Record<string, unknown>;
@@ -14,6 +15,11 @@ type JsonRecord = Record<string, unknown>;
 type ControllerError = Error & { code?: string };
 
 type ControllerCall = <T = unknown>(request: JsonRecord) => Promise<T>;
+
+type TimelineHistoryEntry = {
+  item: any;
+  timestamp?: string;
+};
 
 export type ChatGptCodexifyProviderOptions = {
   controller?: ControllerCall;
@@ -28,6 +34,7 @@ type SessionState = {
   activeTurnId: string | null;
   closed: boolean;
   persist: boolean;
+  timeline: TimelineHistoryEntry[];
 };
 
 type ControllerEnvelope<T = unknown> = {
@@ -90,19 +97,59 @@ async function controller<T>(request: JsonRecord): Promise<T> {
 
 function persistenceHandle(session: SessionState) {
   return {
-    version: 1,
+    version: PERSISTENCE_VERSION,
     data: {
       ...(session.backendSessionId ? { backendSessionId: session.backendSessionId } : {}),
       cwd: session.cwd,
+      timeline: session.timeline.map((entry) => ({
+        item: entry.item,
+        ...(entry.timestamp ? { timestamp: entry.timestamp } : {}),
+      })),
     },
   };
 }
 
 function restoredBackendSessionId(persistence: any): string | null {
-  if (!persistence || persistence.version !== 1 || typeof persistence.data !== "object" || persistence.data === null) {
+  if (
+    !persistence ||
+    ![1, PERSISTENCE_VERSION].includes(persistence.version) ||
+    typeof persistence.data !== "object" ||
+    persistence.data === null
+  ) {
     return null;
   }
   return typeof persistence.data.backendSessionId === "string" ? persistence.data.backendSessionId : null;
+}
+
+function restoredTimeline(persistence: any): TimelineHistoryEntry[] {
+  if (
+    !persistence ||
+    persistence.version !== PERSISTENCE_VERSION ||
+    typeof persistence.data !== "object" ||
+    persistence.data === null ||
+    !Array.isArray(persistence.data.timeline)
+  ) {
+    return [];
+  }
+  return persistence.data.timeline
+    .filter((entry: any) => entry && typeof entry === "object" && entry.item && typeof entry.item === "object")
+    .map((entry: any) => ({
+      item: entry.item,
+      ...(typeof entry.timestamp === "string" ? { timestamp: entry.timestamp } : {}),
+    }));
+}
+
+function updateTimelineSnapshot(session: SessionState, item: any, timestamp?: string) {
+  const next = {
+    item,
+    ...(timestamp ? { timestamp } : {}),
+  };
+  const index = session.timeline.findIndex((entry) => entry.item?.id === item?.id);
+  if (index >= 0) {
+    session.timeline[index] = next;
+  } else {
+    session.timeline.push(next);
+  }
 }
 
 function providerError(error: unknown): { message: string; code?: string } {
@@ -361,6 +408,31 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
         for (const listener of listeners) listener(event);
       };
 
+      const emitPersistence = (providerSessionId: string, session: SessionState) => {
+        if (!session.persist) return;
+        emit({
+          type: "session.persistence",
+          sessionId: providerSessionId,
+          persistence: persistenceHandle(session),
+        });
+      };
+
+      const emitTimeline = (
+        providerSessionId: string,
+        session: SessionState,
+        item: any,
+        timestamp = new Date().toISOString(),
+      ) => {
+        updateTimelineSnapshot(session, item, timestamp);
+        emit({
+          type: "timeline.item",
+          sessionId: providerSessionId,
+          item,
+          timestamp,
+        });
+        emitPersistence(providerSessionId, session);
+      };
+
       const dispatchAvailableBackend = async (workspace: string, prompt: string) => {
         const deadline = Date.now() + Math.max(0, acquireRetryMs);
         for (;;) {
@@ -401,13 +473,7 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
         session.backendSessionId = backendSessionId;
         session.activeRunId = null;
         session.activeTurnId = null;
-        if (session.persist) {
-          emit({
-            type: "session.persistence",
-            sessionId: providerSessionId,
-            persistence: persistenceHandle(session),
-          });
-        }
+        emitPersistence(providerSessionId, session);
       };
 
       const submitPrompt = async (providerSessionId: string, session: SessionState, prompt: string) => {
@@ -561,10 +627,10 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
               const signature = JSON.stringify({ nextState, detail, error });
               if (toolSnapshots.get(itemId) === signature) continue;
               toolSnapshots.set(itemId, signature);
-              emit({
-                type: "timeline.item",
-                sessionId: providerSessionId,
-                item: {
+              emitTimeline(
+                providerSessionId,
+                session,
+                {
                   id: itemId,
                   type: "tool_call",
                   callId: itemId,
@@ -579,8 +645,8 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
                     ...(typeof entry.duration_ms === "number" ? { durationMs: entry.duration_ms } : {}),
                   },
                 },
-                ...(typeof entry.at_ms === "number" ? { timestamp: new Date(entry.at_ms).toISOString() } : {}),
-              });
+                typeof entry.at_ms === "number" ? new Date(entry.at_ms).toISOString() : undefined,
+              );
             }
           } catch {
             // Progress is best-effort; terminal run state remains authoritative.
@@ -600,15 +666,10 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
               if (!isTerminalState(run.state)) continue;
 
               if (run.state === "succeeded") {
-                emit({
-                  type: "timeline.item",
-                  sessionId: providerSessionId,
-                  item: {
-                    id: `assistant-${turnId}`,
-                    type: "assistant_message",
-                    text: run.result ?? "",
-                  },
-                  timestamp: new Date().toISOString(),
+                emitTimeline(providerSessionId, session, {
+                  id: `assistant-${turnId}`,
+                  type: "assistant_message",
+                  text: run.result ?? "",
                 });
                 emit({ type: "session.turn", sessionId: providerSessionId, turnId, state: "completed" });
               } else if (
@@ -701,6 +762,7 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
                 activeTurnId: backendSession?.active_run_id ?? null,
                 closed: false,
                 persist: input.config.persist,
+                timeline: restoredTimeline(input.persistence),
               };
               sessions.set(input.sessionId, state);
               emit({
@@ -724,6 +786,14 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
                   settings: [],
                 },
               });
+              for (const entry of state.timeline) {
+                emit({
+                  type: "timeline.item",
+                  sessionId: input.sessionId,
+                  item: entry.item,
+                  ...(entry.timestamp ? { timestamp: entry.timestamp } : {}),
+                });
+              }
               emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
               if (state.activeRunId && state.activeTurnId) {
                 if (!state.backendSessionId) throw new Error("Restored active ChatGPT backend run has no backend session");
@@ -748,16 +818,11 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
                   run_id: session.activeRunId,
                   instruction,
                 });
-                emit({
-                  type: "timeline.item",
-                  sessionId: input.sessionId,
-                  item: {
-                    id: `user-${input.prompt.clientMessageId}`,
-                    type: "user_message",
-                    text: instruction,
-                    clientMessageId: input.prompt.clientMessageId,
-                  },
-                  timestamp: new Date().toISOString(),
+                emitTimeline(input.sessionId, session, {
+                  id: `user-${input.prompt.clientMessageId}`,
+                  type: "user_message",
+                  text: instruction,
+                  clientMessageId: input.prompt.clientMessageId,
                 });
                 emit({
                   type: "session.prompt_result",
@@ -801,16 +866,11 @@ export function createChatGptCodexifyProvider(options: ChatGptCodexifyProviderOp
                 result: { type: "turn", turnId },
               });
               emit({ type: "session.turn", sessionId: input.sessionId, turnId, state: "started" });
-              emit({
-                type: "timeline.item",
-                sessionId: input.sessionId,
-                item: {
-                  id: `user-${input.prompt.clientMessageId}`,
-                  type: "user_message",
-                  text,
-                  clientMessageId: input.prompt.clientMessageId,
-                },
-                timestamp: new Date().toISOString(),
+              emitTimeline(input.sessionId, session, {
+                id: `user-${input.prompt.clientMessageId}`,
+                type: "user_message",
+                text,
+                clientMessageId: input.prompt.clientMessageId,
               });
               void waitForRun(input.sessionId, session, backendSessionId, run.run_id, turnId);
             } catch (error) {
