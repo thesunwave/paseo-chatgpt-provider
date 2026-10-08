@@ -2,7 +2,34 @@
 
 This guide describes the current **macOS alpha** setup. The provider itself is a Paseo plugin, but it depends on a Codexify build that includes the ChatGPT backend/controller prototype.
 
-## 1. Prerequisites
+## 1. Recommended installation (macOS)
+
+Clone the tagged alpha release and use the installer:
+
+```sh
+git clone --branch v0.1.0-alpha.1 --depth 1 https://github.com/thesunwave/paseo-chatgpt-provider.git
+cd paseo-chatgpt-provider
+./install.sh --dry-run
+./install.sh
+```
+
+The installer reuses a responding controller where one exists. Otherwise it
+builds Codexify at the exact pinned commit
+`e14c5a353a4af842a0751c8e943a5977a0ccd304`, backs up/merges its
+configuration, and installs a **new per-user service only when none exists**.
+It never restarts or overwrites an existing Codexify service.
+
+Options: `--check` (read-only diagnostics), `--dry-run` (plan only),
+`--no-build` (require a working controller), `--no-service` (build and
+configure without starting a service), `--uninstall` (remove this installer’s
+Paseo plugin only), `--yes` (non-interactive trust confirmation). The CLI
+installation is local to the installer state directory if it is initially absent.
+
+The final steps remain interactive: set up the Codexify ChatGPT
+connector/tunnel if necessary (via `codexify quickstart`), enable trusted
+plugins in Paseo Settings, and attach a long-lived ChatGPT conversation.
+
+## 2. Prerequisites for manual installation
 
 You need:
 
@@ -14,15 +41,16 @@ You need:
 
 Paseo plugins are trusted, unsandboxed code. Install this plugin only on a Paseo daemon where you trust the repository and its future updates.
 
-## 2. Build the compatible Codexify branch
+## 3. Build the compatible Codexify revision
 
-The provider currently requires the rich-tool-details branch in the public Codexify fork. That branch is one commit on top of the ChatGPT backend prototype and includes the bounded/redacted request/result previews used by Paseo tool cards:
+The provider requires the rich-tool-details changes from the public Codexify fork.
+Use the known-good commit instead of following a moving feature branch:
 
 ```sh
 git clone https://github.com/thesunwave/codexify.git
 cd codexify
-git checkout feat/paseo-rich-tool-details
-cargo build --release
+git checkout --detach e14c5a353a4af842a0751c8e943a5977a0ccd304
+cargo build --release --locked
 ```
 
 If you do not already have Codexify configured, run its guided setup from the same checkout:
@@ -33,7 +61,7 @@ cargo run --release -- quickstart
 
 The important requirement is that the running Codexify binary comes from a branch containing the ChatGPT backend/controller support used by this provider.
 
-## 3. Configure the ChatGPT backend controller
+## 4. Configure the ChatGPT backend controller
 
 In `codexify.config.json`, enable the bridge and controller.
 
@@ -46,7 +74,6 @@ A tested macOS configuration looks like this:
   "experimental": {
     "chatgptBridge": true,
     "chatgptBackendControllerSocket": "/Users/Shared/codexify-chatgpt/backend.sock",
-    "chatgptBackendControllerAllowedUid": 501,
     "chatgptBackendDelegatedRoots": [
       "/Users/Shared/PaseoWorkspaces"
     ]
@@ -54,9 +81,15 @@ A tested macOS configuration looks like this:
 }
 ```
 
+If Codexify and Paseo run as the same user, do not set
+`chatgptBackendControllerAllowedUid`; the controller then uses a user-only
+socket. Cross-user services need the allowed UID explicitly, and the socket
+directory must be owned by the Codexify service user with safe traversal
+permissions.
+
 Adjust:
 
-- `chatgptBackendControllerAllowedUid` to the UID of the user running the Paseo daemon/provider. On macOS:
+- For cross-user installations only, obtain the UID of the Paseo daemon user:
   ```sh
   id -u
   ```
@@ -77,7 +110,7 @@ CODEXIFY_CHATGPT_BACKEND_SOCKET=/path/to/backend.sock
 
 The Codexify controller and provider must point at the same socket.
 
-## 4. Use a workspace both processes can access
+## 5. Use a workspace both processes can access
 
 If Paseo and Codexify run as the same macOS user, a normal project directory is usually sufficient.
 
@@ -93,7 +126,7 @@ Put or clone Paseo projects under that root and include it in `chatgptBackendDel
 
 Avoid using another user's `Documents` directory for the first setup. macOS TCC can deny a background/service user even when normal POSIX permissions look correct.
 
-## 5. Start Codexify
+## 6. Start Codexify
 
 Run the compatible Codexify build using your normal service setup, or keep it in the foreground while validating the alpha.
 
@@ -103,7 +136,7 @@ The controller socket should appear once the service is ready:
 test -S /Users/Shared/codexify-chatgpt/backend.sock && echo "controller socket is present"
 ```
 
-## 6. Attach a ChatGPT conversation as a backend
+## 7. Attach a ChatGPT conversation as a backend
 
 Open a dedicated ChatGPT conversation with the Codexify connector enabled.
 
@@ -115,7 +148,7 @@ Leave that ChatGPT conversation attached while using Paseo.
 
 The provider does not create a ChatGPT backend by itself. It dispatches work to an already attached backend session.
 
-## 7. Enable Paseo plugins
+## 8. Enable Paseo plugins
 
 In Paseo:
 
@@ -124,7 +157,7 @@ In Paseo:
 
 Paseo installs plugins per daemon, so make sure you are configuring the daemon that owns the workspace you will use.
 
-## 8. Install the provider
+## 9. Install the provider
 
 For a local checkout:
 
@@ -140,10 +173,12 @@ paseo plugin install "$PWD"
 For Git installation:
 
 ```sh
-paseo plugin add thesunwave/paseo-chatgpt-provider --ref master
+paseo plugin add git:thesunwave/paseo-chatgpt-provider --ref v0.1.0-alpha.1
 ```
 
-The repository is currently private. Git installation therefore requires repository access until it is made public.
+Use the explicit `git:` prefix: bare `owner/repo` names can resolve
+through the Paseo plugin registry rather than GitHub. The alpha tag ensures
+that the initial installation is deterministic.
 
 Confirm the plugin is loaded:
 
@@ -151,7 +186,7 @@ Confirm the plugin is loaded:
 paseo plugin ls
 ```
 
-## 9. Use Attached ChatGPT
+## 10. Use Attached ChatGPT
 
 1. Open a Paseo workspace that Codexify can access.
 2. Start a new agent chat.
@@ -172,7 +207,7 @@ Expected behavior:
 - the assistant answer appears after the tool call;
 - restarting Paseo and reopening the same chat restores the timeline.
 
-## 10. Updating the plugin
+## 11. Updating the plugin
 
 Git-installed Paseo plugins can be checked and updated with:
 

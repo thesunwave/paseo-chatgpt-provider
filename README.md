@@ -33,7 +33,7 @@ The current implementation supports:
 
 - Paseo `>= 0.9.2` with plugins enabled.
 - A Codexify build containing the ChatGPT backend/controller and rich tool-preview support from
-  `thesunwave/codexify`, branch `feat/paseo-rich-tool-details`.
+  `thesunwave/codexify`, pinned commit `e14c5a353a4af842a0751c8e943a5977a0ccd304`.
 - A ChatGPT conversation connected to that Codexify instance and attached as a long-lived backend.
 - A workspace that the Codexify service user can access.
 
@@ -43,14 +43,25 @@ The current alpha has only been exercised on macOS. The provider talks to Codexi
 
 See [docs/INSTALL.md](docs/INSTALL.md) for the full setup.
 
-Once prerequisites are ready, Paseo can install the plugin directly from Git:
+Run the conservative macOS installer:
 
 ```sh
-paseo plugin add thesunwave/paseo-chatgpt-provider --ref master
-paseo plugin ls
+git clone https://github.com/thesunwave/paseo-chatgpt-provider.git
+cd paseo-chatgpt-provider
+./install.sh --dry-run
+./install.sh
 ```
 
-The repository is currently private, so this command only works for users with repository access. Public Git distribution will work without changing the plugin code once the repository is public.
+The installer pins the Codexify revision and preserves running services and
+existing configuration. You must still connect ChatGPT to Codexify and attach
+one dedicated backend conversation. Use `./install.sh --check` to diagnose or
+`./install.sh --uninstall` to remove only the installed Paseo plugin.
+
+If Codexify is already configured, install the provider directly from Git:
+
+```sh
+paseo plugin add git:thesunwave/paseo-chatgpt-provider --ref v0.1.0-alpha.1
+```
 
 ## Using it
 
@@ -77,16 +88,15 @@ test -S /Users/Shared/codexify-chatgpt/backend.sock && echo "controller socket i
 
 The plugin itself can already be distributed directly from a Git repository; publishing to npm is not required by Paseo. `package.json` intentionally remains `private` while this is an alpha and while Git distribution is the primary path.
 
-Before calling this a public beta, the remaining release work is mostly packaging and project hygiene rather than core functionality:
+Before calling this a public beta, the remaining work is mostly compatibility and operational hardening:
 
-- make this repository public;
-- choose and add a license;
-- tag a known-good alpha release instead of telling users to follow moving `master`;
 - publish or upstream a compatible Codexify build so users do not have to build the prototype branch manually;
 - define/test Linux support, or explicitly keep the first release macOS-only;
 - bound or compact very long persisted timelines if large conversations become a practical issue.
 
 See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the concrete alpha/beta checklist.
+
+Licensed under [MIT](LICENSE).
 
 ## Development
 
