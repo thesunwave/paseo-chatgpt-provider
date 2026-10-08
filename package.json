@@ -1,22 +1,26 @@
 {
   "name": "chatgpt-codexify",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0-alpha.1",
+  "description": "Use an attached ChatGPT conversation as a Paseo coding backend through Codexify",
+  "license": "MIT",
   "type": "module",
   "files": [
     "paseo-plugin.json",
+    "install.sh",
     "index.client.ts",
     "index.client.tsx",
     "index.server.ts",
     "index.server.tsx",
     "client/",
     "docs/",
+    "scripts/merge-codexify-config.py",
     "server/",
     "shared/"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test server/provider.test.ts"
+    "test": "node --test server/provider.test.ts && python3 -m unittest discover -s tests -p 'test_*.py'"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.9.2",

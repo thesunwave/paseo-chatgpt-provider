@@ -19,11 +19,13 @@ The core integration is already working. The remaining work is mostly packaging,
 ## Before public alpha
 
 - [ ] Make `thesunwave/paseo-chatgpt-provider` public.
-- [ ] Choose and add a license.
-- [ ] Merge or otherwise freeze the compatible Codexify rich-tool-details revision.
+- [x] Choose and add MIT license.
+- [x] Freeze Codexify at `e14c5a353a4af842a0751c8e943a5977a0ccd304`.
 - [ ] Tag a known-good provider release, for example `v0.1.0-alpha.1`.
-- [ ] Pin the install guide to that provider tag and a known-good Codexify commit/tag instead of moving branches.
-- [ ] Decide whether the first public alpha is explicitly macOS-only.
+- [x] Pin the documented Codexify revision and provider alpha tag.
+- [x] Declare the first public alpha macOS-only.
+- [x] Add idempotent installer with check/dry-run/uninstall and config backups.
+- [x] Verify installer logic with mock controller tests (not a clean-machine service installation).
 
 ## Before beta
 
