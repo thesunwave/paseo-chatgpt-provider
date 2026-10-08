@@ -1,8 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const PROVIDER_PROTOCOL_VERSION = 1;
 const DEFAULT_SOCKET_PATH = "/Users/Shared/codexify-chatgpt/backend.sock";
+const SIDECAR_HOME = join(homedir(), ".local/share/paseo-codexify-sidecar");
+const SIDECAR_SOCKET = join(SIDECAR_HOME, "controller.sock");
 const INTERRUPT_GRACE_MS = 20_000;
 const ACQUIRE_RETRY_MS = 2_500;
 const ACQUIRE_RETRY_INTERVAL_MS = 100;
@@ -45,7 +50,10 @@ type ControllerEnvelope<T = unknown> = {
 };
 
 function controllerSocketPath(): string {
-  return process.env.CODEXIFY_CHATGPT_BACKEND_SOCKET?.trim() || DEFAULT_SOCKET_PATH;
+  const configured = process.env.CODEXIFY_CHATGPT_BACKEND_SOCKET?.trim();
+  if (configured) return configured;
+  if (existsSync(SIDECAR_SOCKET) || existsSync(join(SIDECAR_HOME, "state.json"))) return SIDECAR_SOCKET;
+  return DEFAULT_SOCKET_PATH;
 }
 
 async function controller<T>(request: JsonRecord): Promise<T> {
