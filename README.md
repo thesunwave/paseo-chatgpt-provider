@@ -1,56 +1,103 @@
 # Paseo ChatGPT via Codexify
 
-Experimental Paseo provider that routes Paseo agent sessions into an attached ChatGPT conversation through Codexify.
-
-## Prototype architecture
+Use an attached ChatGPT conversation as a coding backend inside Paseo.
 
 ```text
 Paseo
   -> chatgpt-codexify provider
-  -> Codexify ChatGPT backend controller
+  -> Codexify backend controller
   -> attached long-lived ChatGPT conversation
   -> Codexify project tools
-  -> provider timeline/result events
+  -> live tool timeline + result
   -> Paseo UI
 ```
 
-The provider is intentionally separate from Paseo Observatory. Observatory monitors Paseo runs; this repository makes ChatGPT itself usable as a Paseo coding backend.
+## Status
 
-## What works
+**Alpha.** The integration is working end-to-end and has been tested with a real Paseo workspace, a real Codexify service, and a real attached ChatGPT conversation on macOS.
 
-The current prototype has been exercised end-to-end with a real Paseo workspace and a real attached ChatGPT backend.
+The current implementation supports:
 
-- Paseo exposes an `Attached ChatGPT` model.
-- Fresh prompts are dispatched atomically to an available ChatGPT backend.
-- A live backend can be rebound to a different delegated workspace.
-- Long-lived Paseo sessions can recover from backend worker rotation.
-- Follow-up prompts can steer an active ChatGPT turn.
-- Paseo interrupt requests cancel or abandon stuck backend work safely.
-- Backend tool lifecycle is streamed into Paseo as live tool-call timeline items.
-- Backend pool state, drain lifecycle, stale detection, and bounded recovery are supported.
-- Workspace delegation allows Paseo projects outside Codexify's primary `workDir`, when explicitly configured.
+- `Attached ChatGPT` as a Paseo model.
+- Atomic dispatch to an available ChatGPT backend session.
+- Workspace rebinding through Codexify delegated roots.
+- Follow-up steering while a ChatGPT turn is active.
+- Paseo interrupt/cancel handling with bounded recovery.
+- Live tool-call timeline updates.
+- Rich shell details: command, output, exit code, and normalized errors.
+- Long-running shell processes folded into one card across `exec_command` / `write_stdin`.
+- Durable provider-side timeline history across Paseo/provider/backend restarts.
+- Recovery when an old Codexify backend session is stale or gone.
 
-A real E2E smoke was verified against a shared checkout under:
+## Requirements
 
-```text
-/Users/Shared/PaseoWorkspaces/telegram_history_bot
+- Paseo `>= 0.9.2` with plugins enabled.
+- A Codexify build containing the ChatGPT backend/controller and rich tool-preview support from
+  `thesunwave/codexify`, branch `feat/paseo-rich-tool-details`.
+- A ChatGPT conversation connected to that Codexify instance and attached as a long-lived backend.
+- A workspace that the Codexify service user can access.
+
+The current alpha has only been exercised on macOS. The provider talks to Codexify through a local Unix-domain socket, so Windows is not currently a supported target.
+
+## Install
+
+See [docs/INSTALL.md](docs/INSTALL.md) for the full setup.
+
+Once prerequisites are ready, Paseo can install the plugin directly from Git:
+
+```sh
+paseo plugin add thesunwave/paseo-chatgpt-provider --ref master
+paseo plugin ls
 ```
 
-The full path worked across the two macOS users involved in the prototype: Paseo runs under the desktop user and Codexify runs under the dedicated `codexify` user.
+The repository is currently private, so this command only works for users with repository access. Public Git distribution will work without changing the plugin code once the repository is public.
 
-## Current limitation
+## Using it
 
-Paseo currently receives tool lifecycle metadata such as:
+1. Keep one ChatGPT conversation attached to Codexify as a Paseo backend.
+2. Open a workspace in Paseo.
+3. Select `Attached ChatGPT` from the model selector.
+4. Send a coding task normally.
 
-- tool name
-- running/completed/failed state
-- duration
-- backend task/tool sequence IDs
+Paseo will show ChatGPT replies and tool activity in the same timeline. Persisted sessions restore their user messages, tool cards, and assistant replies after a Paseo restart.
 
-It does **not** yet receive rich tool details such as command arguments, file paths, stdout/stderr, diffs, or result previews. The next useful increment is bounded and redacted tool request/result previews from Codexify, surfaced through the provider's `tool_call.detail` / metadata.
+## Troubleshooting
 
-## Related Codexify work
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
-The matching Codexify prototype lives in the `thesunwave/codexify` fork and contains the ChatGPT backend/controller, atomic dispatch, lifecycle hardening, workspace delegation, and tool-progress timeline support required by this provider.
+Useful first checks:
 
-This is a working prototype, not a production-ready integration.
+```sh
+paseo plugin ls
+paseo plugin logs chatgpt-codexify
+test -S /Users/Shared/codexify-chatgpt/backend.sock && echo "controller socket is present"
+```
+
+## Distribution notes
+
+The plugin itself can already be distributed directly from a Git repository; publishing to npm is not required by Paseo. `package.json` intentionally remains `private` while this is an alpha and while Git distribution is the primary path.
+
+Before calling this a public beta, the remaining release work is mostly packaging and project hygiene rather than core functionality:
+
+- make this repository public;
+- choose and add a license;
+- tag a known-good alpha release instead of telling users to follow moving `master`;
+- publish or upstream a compatible Codexify build so users do not have to build the prototype branch manually;
+- define/test Linux support, or explicitly keep the first release macOS-only;
+- bound or compact very long persisted timelines if large conversations become a practical issue.
+
+See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the concrete alpha/beta checklist.
+
+## Development
+
+```sh
+npm ci
+npm test
+npm run typecheck
+```
+
+The plugin uses Paseo's runtime-provided SDK/libraries. Development dependencies are present for typechecking and tests.
+
+## Relationship to Paseo Observatory
+
+This project is separate from Paseo Observatory. Observatory monitors Paseo runs; this repository makes ChatGPT itself usable as a Paseo coding backend.
