@@ -46,7 +46,7 @@ See [docs/INSTALL.md](docs/INSTALL.md) for the full setup.
 Run the conservative macOS installer:
 
 ```sh
-git clone https://github.com/thesunwave/paseo-chatgpt-provider.git
+git clone --branch v0.1.0-alpha.1 --depth 1 https://github.com/thesunwave/paseo-chatgpt-provider.git
 cd paseo-chatgpt-provider
 ./install.sh --dry-run
 ./install.sh
