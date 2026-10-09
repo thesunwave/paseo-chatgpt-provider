@@ -1,5 +1,7 @@
 # Installation
 
+**For new installations, prefer the independent [Paseo Codexify sidecar](https://github.com/thesunwave/paseo-codexify-sidecar), which works with stock Codexify without a fork.** The steps below describe the legacy fork-based configuration.
+
 This guide describes the current **macOS alpha** setup. The provider itself is a Paseo plugin, but it depends on a Codexify build that includes the ChatGPT backend/controller prototype.
 
 ## 1. Recommended installation (macOS)

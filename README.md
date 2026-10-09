@@ -32,36 +32,36 @@ The current implementation supports:
 ## Requirements
 
 - Paseo `>= 0.9.2` with plugins enabled.
-- A Codexify build containing the ChatGPT backend/controller and rich tool-preview support from
-  `thesunwave/codexify`, pinned commit `e14c5a353a4af842a0751c8e943a5977a0ccd304`.
-- A ChatGPT conversation connected to that Codexify instance and attached as a long-lived backend.
-- A workspace that the Codexify service user can access.
+- **Recommended:** stock Codexify **v1.7.0** plus the standalone [Paseo Codexify sidecar](https://github.com/thesunwave/paseo-codexify-sidecar). The sidecar is an MCP proxy and controller, so no Codexify fork is needed.
+- **Legacy:** our pinned Codexify fork `e14c5a353a4af842a0751c8e943a5977a0ccd304` is still compatible with this provider.
+- A dedicated ChatGPT conversation attached to the backend, and a workspace accessible to the Codexify process.
 
-The current alpha has only been exercised on macOS. The provider talks to Codexify through a local Unix-domain socket, so Windows is not currently a supported target.
+The integration is macOS-tested. The provider communicates with the controller through a local Unix socket.
 
-## Install
+## Install (preferred: stock Codexify, no fork)
 
-See [docs/INSTALL.md](docs/INSTALL.md) for the full setup.
-
-Run the conservative macOS installer:
+Follow the [sidecar installation guide](https://github.com/thesunwave/paseo-codexify-sidecar#installation) and run its installer, then attach ChatGPT through the sidecar MCP tools:
 
 ```sh
-git clone --branch v0.1.0-alpha.1 --depth 1 https://github.com/thesunwave/paseo-chatgpt-provider.git
-cd paseo-chatgpt-provider
+git clone --branch v0.2.0-alpha.1 --depth 1 https://github.com/thesunwave/paseo-codexify-sidecar.git
+cd paseo-codexify-sidecar
 ./install.sh --dry-run
 ./install.sh
 ```
 
-The installer pins the Codexify revision and preserves running services and
-existing configuration. You must still connect ChatGPT to Codexify and attach
-one dedicated backend conversation. Use `./install.sh --check` to diagnose or
-`./install.sh --uninstall` to remove only the installed Paseo plugin.
-
-If Codexify is already configured, install the provider directly from Git:
+The provider can be installed independently with:
 
 ```sh
-paseo plugin add git:thesunwave/paseo-chatgpt-provider --ref v0.1.0-alpha.1
+paseo plugin add git:thesunwave/paseo-chatgpt-provider --ref v0.2.0-alpha.1
 ```
+
+The provider detects the new user-private sidecar socket automatically. `CODEXIFY_CHATGPT_BACKEND_SOCKET` continues to override the path; if neither is configured, the old `/Users/Shared/codexify-chatgpt/backend.sock` fallback remains.
+
+The HTTPS tunnel/ChatGPT connector and dedicated ChatGPT backend attachment require user action. **Do not publish the local unauthenticated MCP proxy directly to the Internet.**
+
+### Legacy Codexify fork
+
+The original installer (`./install.sh` in this provider repository) remains available for existing fork-based installations; see [docs/INSTALL.md](docs/INSTALL.md). It builds our pinned Codexify branch and is not the recommended new-install path.
 
 ## Using it
 
@@ -90,9 +90,10 @@ The plugin itself can already be distributed directly from a Git repository; pub
 
 Before calling this a public beta, the remaining work is mostly compatibility and operational hardening:
 
-- publish or upstream a compatible Codexify build so users do not have to build the prototype branch manually;
-- define/test Linux support, or explicitly keep the first release macOS-only;
-- bound or compact very long persisted timelines if large conversations become a practical issue.
+- real ChatGPT connector/tunnel acceptance test for the new sidecar setup;
+- clean-machine macOS install verification;
+- Linux service packaging and policy checks;
+- bounded long-history retention and credentials/sensitive-output redaction review.
 
 See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the concrete alpha/beta checklist.
 
